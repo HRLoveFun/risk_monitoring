@@ -30,6 +30,9 @@ jobs:
           SMTP_PASS: ${{ secrets.SMTP_PASS }}
           MAIL_FROM: ${{ secrets.MAIL_FROM }}
           MAIL_TO: ${{ secrets.MAIL_TO }}
+          # 非敏感参数,直接写在这里(改基金只需改这两行)
+          FUND_NAME: "3416.HK"
+          FUND_URL: "https://www.globalxetfs.com.hk/funds/hscei-covered-call-etf/"
         run: python daily_holdings.py
 
       - name: Persist snapshots
