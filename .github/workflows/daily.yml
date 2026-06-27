@@ -7,9 +7,10 @@ on:
     - cron: "*/10 3-15 * * 1-5"
   workflow_dispatch: {}   # 允许在网页上手动点一下触发(方便测试)
 
-# 允许把每日快照提交回仓库(供"日间对比"用,否则跑完即丢)
+# contents: 把每日快照提交回仓库(供"日间对比");issues: 失败兜底建 Issue
 permissions:
   contents: write
+  issues: write
 
 jobs:
   run:
@@ -44,3 +45,21 @@ jobs:
           git add data/holdings_*.csv data/state.json 2>/dev/null || true
           git commit -m "data: holdings snapshot [skip ci]" 2>/dev/null || echo "nothing to commit"
           git push 2>/dev/null || echo "nothing to push"
+
+      # 兜底:任务失败时建 Issue(每天最多一个,避免高频触发刷屏)。
+      # 覆盖"连告警邮件都发不出去 / Runner 自身挂了"等脚本兜不住的情况。
+      - name: Notify on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          DATE=$(date -u +%F)
+          TITLE="持仓日报运行失败 $DATE"
+          NUM=$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$NUM" ]; then
+            echo "今日已有失败告警 Issue #$NUM,跳过以防刷屏"
+          else
+            gh issue create --title "⚠️ $TITLE" \
+              --body "$(printf '工作流运行失败,请检查。\n\nRun: %s\n时间(UTC): %s' "$RUN_URL" "$(date -u +%FT%TZ)")"
+          fi

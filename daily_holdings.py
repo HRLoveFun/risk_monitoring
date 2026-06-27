@@ -562,38 +562,55 @@ def send_email(subject, html_body, attachments=None):
 
 
 def send_failure_alert(error_text):
-    """尽力而为地发一封失败告警;发不出去也不再抛异常。"""
+    """发一封失败告警;按天去重(高频触发时官网长时间故障也只发一封),发不出去不再抛异常。"""
+    today = date.today().isoformat()
+    if not FORCE_SEND and read_state().get("last_alert_date") == today:
+        logger.info("今日已发过失败告警,本次不重复发(避免高频触发刷屏)")
+        return
     try:
         send_email(
-            subject=f"[ETF日报-失败] {FUND_NAME} {date.today():%Y-%m-%d}",
+            subject=f"[ETF日报-失败] {FUND_NAME} {today}",
             html_body=f"<p>每日持仓任务执行失败:</p><pre>{error_text}</pre>",
         )
+        write_state(last_alert_date=today)   # 标记今天已告警
     except Exception as e:
         logger.error("连失败告警都发不出去: %s", e)
 
 
 # ----------------------------------------------------------------------------
-# 幂等:同一截止日期不重复发
+# 状态文件(幂等去重 + 告警去重)
 # ----------------------------------------------------------------------------
-STATE_FILE = lambda: os.path.join(DATA_DIR, "state.json")
+def STATE_FILE():
+    return os.path.join(DATA_DIR, "state.json")
+
+
+def read_state():
+    try:
+        with open(STATE_FILE(), encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
+def write_state(**updates):
+    """读-改-写,只更新传入的字段,不覆盖其它键(如 last_as_of 与 last_alert_date 互不影响)。"""
+    st = read_state()
+    st.update(updates)
+    with open(STATE_FILE(), "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False)
 
 
 def already_sent(as_of):
+    """同一持仓截止日期只发一次 —— 这是高频触发不刷屏的关键。"""
     if FORCE_SEND or as_of is None:
         return False
-    try:
-        with open(STATE_FILE(), encoding="utf-8") as f:
-            return json.load(f).get("last_as_of") == as_of.isoformat()
-    except (FileNotFoundError, ValueError):
-        return False
+    return read_state().get("last_as_of") == as_of.isoformat()
 
 
 def mark_sent(as_of):
     if as_of is None:
         return
-    with open(STATE_FILE(), "w", encoding="utf-8") as f:
-        json.dump({"last_as_of": as_of.isoformat(),
-                   "sent_at": datetime.now().isoformat()}, f, ensure_ascii=False)
+    write_state(last_as_of=as_of.isoformat(), sent_at=datetime.now().isoformat())
 
 
 # ----------------------------------------------------------------------------

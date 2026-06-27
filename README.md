@@ -39,6 +39,15 @@
 - 净效果:**数据更新后最多 10 分钟内收到,且每个交易日最多一封**。
 - 调试强制重发:`FORCE_SEND=1`(忽略去重)。
 
+## 失败通知(两层兜底)
+高频触发下,故障也不会刷屏 —— 两层告警都**按天去重**:
+
+1. **脚本层(SMTP 告警)**:任一步异常 → 发一封失败邮件;同一天只发一次
+   (`state.json` 的 `last_alert_date`)。
+2. **工作流层(GitHub Issue)**:`if: failure()` 时自动建一个 Issue(每天最多一个),
+   覆盖"连告警邮件都发不出去 / Runner 自身挂了"等脚本兜不住的情况;
+   GitHub 会就该 Issue 通知你。需 `issues: write` 权限(workflow 已声明)。
+
 ## 本地运行
 ```bash
 pip install -r requirements.txt
