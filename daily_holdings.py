@@ -503,7 +503,8 @@ NAV 由"市值/权重"反推。完整持仓见附件 CSV。<br>
 数据来源:{FUND_URL}<br>本邮件由脚本自动生成于 {datetime.now():%Y-%m-%d %H:%M:%S}。</p>
 </body></html>"""
 
-    subject = f"[ETF日报] {FUND_NAME} 持仓 {as_of_str}(正股{len(eq)}只)"
+    as_of_compact = as_of.strftime("%Y%m%d") if as_of else date.today().strftime("%Y%m%d")
+    subject = f"{as_of_compact} {FUND_NAME} 持仓"
     return subject, body
 
 
