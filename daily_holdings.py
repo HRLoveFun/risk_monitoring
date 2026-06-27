@@ -399,6 +399,7 @@ def build_summary(data, prev_full):
 
     # ---- a. 前5大重仓 ----
     top = eq.sort_values(weight_col, ascending=False).head(5)
+    top5_pct = float(top[weight_col].sum())
     top_rows = "".join(
         f"<tr><td>{i}</td><td>{r[name_col]}</td><td>{r[key_col]}</td>"
         f"<td style='text-align:right'>{r[weight_col]:.2f}%</td></tr>"
@@ -472,16 +473,15 @@ def build_summary(data, prev_full):
     body = f"""\
 <html><body style="font-family:Arial,'Microsoft YaHei',sans-serif;font-size:14px">
 <h2>{FUND_NAME} 每日持仓日报</h2>
-<p><b>持仓截止日期:</b>{as_of_str} &nbsp;|&nbsp; <b>正股数量:</b>{len(eq)} &nbsp;|&nbsp;
-   <b>基金净值(估):</b>{nav_str}</p>
+<p><b>持仓截止日期:</b>{as_of_str} &nbsp;|&nbsp; <b>基金净值(估):</b>{nav_str}</p>
 
-<h3>a. 前五大重仓</h3>
+<h3>a. 前五大重仓占比 {top5_pct:.2f}%</h3>
 <table border="1" cellspacing="0" cellpadding="4">
 <tr><th>#</th><th>名称</th><th>代码</th><th>权重</th></tr>
 {top_rows}
 </table>
 
-<h3>b. 三个真实仓位</h3>
+<h3>b. 风险暴露</h3>
 <table border="1" cellspacing="0" cellpadding="4">
 <tr><th>仓位</th><th>名义占净值</th><th>Delta调整后</th><th>算法</th></tr>
 {pos_rows}
