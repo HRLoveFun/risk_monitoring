@@ -25,7 +25,19 @@
      - 净方向性敞口 = 正股 + 期货 + 期权(Delta 调整)
    - **c. 指数现价 → 行权价距离**(含剩余到期天数)
    - 较上一交易日变化:新增 / 剔除 / 权重变化 Top5(仅正股)
-4. 全程日志;失败发告警邮件;同一截止日期不重复发(幂等)
+4. 全程日志;失败发告警邮件;**按持仓截止日期幂等去重**(详见下文「调度与幂等」)
+
+## 调度与幂等(为什么可以每 10 分钟跑)
+官网持仓是「隔日更新」,且当天具体几点更新不固定。为尽快收到、又不重复发,
+采用「**高频触发 + 按日期去重**」:
+
+- 触发:工作日每 10 分钟跑一次(见部署)。
+- 每次跑都读页面上的 `As of <日期>` 作为「持仓截止日」,与状态文件 `data/state.json`
+  里 `last_as_of` 比对:
+  - **日期没更新** → 直接跳过:不发邮件、不存快照、工作流仍成功(`nothing to commit`)。
+  - **日期推进到新交易日** → 发一封(带「较上一交易日变化」),并把新日期写回 `state.json`。
+- 净效果:**数据更新后最多 10 分钟内收到,且每个交易日最多一封**。
+- 调试强制重发:`FORCE_SEND=1`(忽略去重)。
 
 ## 本地运行
 ```bash
@@ -41,15 +53,30 @@ python daily_holdings.py
 QQ邮箱 → 设置 → 账号 → 开启 IMAP/SMTP → 生成授权码。
 `SMTP_HOST=smtp.qq.com`,`SMTP_PORT=465`(SSL)。
 
-## 部署:GitHub Actions(推荐,免运维免费)
-1. 把本目录推到一个(私有)GitHub 仓库。
-2. 仓库 Settings → Secrets and variables → Actions,加这些 Secret:
-   `SMTP_HOST` `SMTP_PORT` `SMTP_USER` `SMTP_PASS` `MAIL_FROM` `MAIL_TO`
-3. `.github/workflows/daily.yml` 已配好:工作日香港时间 11:00 自动运行,
-   也可在 Actions 页面点 "Run workflow" 手动测试。
-4. 每日快照会自动提交回仓库,用于次日对比。
+## 部署:GitHub Actions(已上线,免运维免费)
+当前部署在 **公开仓库**(公开仓库的 Actions 额度无限,故可每 10 分钟跑;
+私有仓库免费额度 2,000 分钟/月,高频会不够)。授权码等放加密 Secret,**公开不泄露**。
 
-> 想用自己的服务器(如 Oracle Cloud 永久免费机)也行,crontab:
+1. 推到一个 **公开** GitHub 仓库。
+2. 仓库 Settings → Secrets and variables → Actions,加这 6 个 Secret:
+   `SMTP_HOST` `SMTP_PORT` `SMTP_USER` `SMTP_PASS` `MAIL_FROM` `MAIL_TO`
+   (`FUND_NAME`、`FUND_URL` 非敏感,直接写在 workflow 的 `env:` 里,改基金只改这两行。)
+3. `.github/workflows/daily.yml` 已配好:
+   - 定时 `*/10 3-15 * * 1-5`(UTC)= **工作日 港时 11:00–23:50 每 10 分钟**;
+   - 也可在 Actions 页面点 "Run workflow" 手动触发;
+   - 跑完把当日快照(`data/holdings_*.csv`、`state.json`)提交回仓库,供次日对比。
+4. 用 `gh` 一键创建并配置(参考)::
+   ```bash
+   gh repo create <name> --public --source=. --push
+   set -a; source .env; set +a
+   for k in SMTP_HOST SMTP_PORT SMTP_USER SMTP_PASS MAIL_FROM MAIL_TO; do
+     gh secret set "$k" --body "${!k}"; done
+   gh workflow run daily-holdings        # 手动触发一次验证
+   ```
+
+> 注:GitHub 定时任务不保证准点,高峰期可能延迟几分钟或偶尔跳过;配合幂等去重不影响结果。
+>
+> 想改用自己的服务器(如 Oracle Cloud 永久免费机)也行,等价 crontab:
 > ```cron
-> 30 9 * * 1-5  cd /path/app && /path/venv/bin/python daily_holdings.py
+> */10 11-23 * * 1-5  cd /path/app && set -a && . ./.env && set +a && /path/venv/bin/python daily_holdings.py
 > ```
