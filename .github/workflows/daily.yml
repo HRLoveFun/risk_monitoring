@@ -1,0 +1,42 @@
+name: daily-holdings
+
+on:
+  schedule:
+    # GitHub 用 UTC。01:30 UTC = 香港时间 09:30,工作日运行。
+    - cron: "30 1 * * 1-5"
+  workflow_dispatch: {}   # 允许在网页上手动点一下触发(方便测试)
+
+# 允许把每日快照提交回仓库(供"日间对比"用,否则跑完即丢)
+permissions:
+  contents: write
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install -r requirements.txt
+
+      - name: Run
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_FROM: ${{ secrets.MAIL_FROM }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: python daily_holdings.py
+
+      - name: Persist snapshots
+        if: always()
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add data/holdings_*.csv data/state.json 2>/dev/null || true
+          git commit -m "data: holdings snapshot [skip ci]" 2>/dev/null || echo "nothing to commit"
+          git push 2>/dev/null || echo "nothing to push"
