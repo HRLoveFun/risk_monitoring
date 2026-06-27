@@ -102,12 +102,13 @@ def fetch_page(url):
     for attempt in range(1, HTTP_RETRIES + 1):
         try:
             logger.info("抓取页面(第 %d 次): %s", attempt, url)
-            resp = requests.get(url, headers=headers, timeout=HTTP_TIMEOUT)
-            resp.raise_for_status()
+            # timeout=(连接超时, 读取超时):连不上 10s 就放弃,慢响应最多等 30s
+            resp = requests.get(url, headers=headers, timeout=(10, HTTP_TIMEOUT))
+            resp.raise_for_status()                      # 4xx/5xx 直接抛错进入重试
             html = resp.text
-            # 内容健壮性校验:防止下到错误页/验证页却当成正常页面
-            if "holdingsList" not in html:
-                raise ValueError("页面中找不到持仓表(holdingsList),结构可能已变化")
+            # 内容健壮性校验:状态码 200 不等于拿到正确页面(可能是错误页/反爬页/空壳)
+            if len(html) < 10000 or "holdingsList" not in html:
+                raise ValueError(f"页面内容异常(长度 {len(html)},未含 holdingsList),疑似错误页")
             logger.info("页面抓取成功,大小 %d 字节", len(html))
             return html
         except Exception as e:
@@ -172,12 +173,23 @@ def split_equities(df):
     """把完整持仓表拆成『正股』和『衍生品行(期货/期权)』。
 
     正股:Exchange Ticker 形如 `939 HK`(纯数字 + HK);衍生品:期货(HCM6)、
-    期权(名称含 CALL/PUT/FUTURE 或空代码)等。靠代码格式判断,稳。
+    期权(名称含 CALL/PUT/FUTURE 或空代码)等。靠『格式/关键词』判断而非行数,
+    所以正股或衍生品数量怎么变都不影响分类(50→48 只、多一个期货腿都没问题)。
     """
     ticker = df["Exchange Ticker"].astype(str).str.strip()
     name = df["Name of Securities"].astype(str).str.upper()
     is_eq = ticker.str.match(r"^\d+\s*HK$") & ~name.str.contains(r"CALL|PUT|FUTURE")
-    return df[is_eq].reset_index(drop=True), df[~is_eq].reset_index(drop=True)
+    equities = df[is_eq].reset_index(drop=True)
+    derivatives = df[~is_eq].reset_index(drop=True)
+
+    # 健壮性:出现既不是期货也不是期权的"未知衍生品"(如 SWAP/BOND)时告警,
+    # 以便及时发现页面新增了我们没处理的工具类型,而不是默默算错。
+    if not derivatives.empty:
+        known = derivatives["Name of Securities"].astype(str).str.upper().str.contains(
+            r"CALL|PUT|FUTURE")
+        for nm in derivatives.loc[~known, "Name of Securities"]:
+            logger.warning("发现未识别的非正股工具:%s(未纳入期货/期权计算,请检查)", nm)
+    return equities, derivatives
 
 
 def derive_nav(equities):
@@ -238,6 +250,8 @@ def parse_holdings(html):
                 options_df[col] = _clean_num(options_df[col])
 
     equities, derivatives = split_equities(df)
+    if equities.empty:
+        raise ValueError("拆分后正股为空,持仓表代码格式可能已变化,请检查")
     nav = derive_nav(equities)
 
     as_of = parse_as_of_date(html)
@@ -336,6 +350,7 @@ def compute_positions(data):
     # (3) 期权空头压力 = Σ(名义敞口/NAV × 估算Delta);名义敞口占比页面已给
     pct_col = "Notional Exposure to NAV (%)"
     opt_pressure = 0.0
+    opt_notional = 0.0
     opt_rows = []
     if not opt.empty and pct_col in opt.columns:
         for _, r in opt.iterrows():
@@ -347,11 +362,13 @@ def compute_positions(data):
             if pd.notna(notional_pct) and delta is not None:
                 contrib = notional_pct * delta      # 名义占比(空头为负)× delta
                 opt_pressure += contrib
+                opt_notional += notional_pct
                 opt_rows.append({
                     "pos": r.get("Option Position"), "delta": delta,
                     "notional_pct": notional_pct, "contrib": contrib,
                 })
-    res["option_pressure_pct"] = opt_pressure if opt_rows else None
+    res["option_notional_pct"] = opt_notional if opt_rows else None    # 名义口径(未调整)
+    res["option_pressure_pct"] = opt_pressure if opt_rows else None    # Delta 调整后
     res["option_rows"] = opt_rows
 
     # (c) 指数现价到行权价的距离(去重)
@@ -394,13 +411,15 @@ def build_summary(data, prev_full):
     def pct(v):
         return "N/A" if v is None else f"{v:.2f}%"
 
+    # 三列:名义口径 / Delta调整后 / 算法。正股、期货无需 Delta 调整,故标 "—"。
     pos_rows = (
         f"<tr><td>正股敞口</td><td style='text-align:right'>{pct(p['equity_pct'])}</td>"
-        f"<td>≈ 总正股市值 / 基金净值</td></tr>"
+        f"<td style='text-align:right'>—</td><td>≈ 总正股市值 / 基金净值</td></tr>"
         f"<tr><td>期货多头敞口</td><td style='text-align:right'>{pct(p['futures_pct'])}</td>"
-        f"<td>合约张数 × 指数点 × {INDEX_MULTIPLIER:.0f} / 净值</td></tr>"
-        f"<tr><td>期权空头压力(Delta调整)</td><td style='text-align:right'>{pct(p['option_pressure_pct'])}</td>"
-        f"<td>Σ 名义占比 × 估算Delta(IV={IMPLIED_VOL:.0%})</td></tr>"
+        f"<td style='text-align:right'>—</td><td>合约张数 × 指数点 × {INDEX_MULTIPLIER:.0f} / 净值</td></tr>"
+        f"<tr><td>期权空头敞口</td><td style='text-align:right'>{pct(p['option_notional_pct'])}</td>"
+        f"<td style='text-align:right'>{pct(p['option_pressure_pct'])}</td>"
+        f"<td>名义 = Σ 名义占比;调整 = × 估算Delta(IV={IMPLIED_VOL:.0%})</td></tr>"
     )
     net_directional = None
     if None not in (p["equity_pct"], p["futures_pct"], p["option_pressure_pct"]):
@@ -464,7 +483,7 @@ def build_summary(data, prev_full):
 
 <h3>b. 三个真实仓位</h3>
 <table border="1" cellspacing="0" cellpadding="4">
-<tr><th>仓位</th><th>占净值</th><th>算法</th></tr>
+<tr><th>仓位</th><th>名义占净值</th><th>Delta调整后</th><th>算法</th></tr>
 {pos_rows}
 </table>
 {net_html}
