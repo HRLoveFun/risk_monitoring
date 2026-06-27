@@ -11,6 +11,13 @@
 2. 解析完整持仓表 + 期权敞口表(按表头列名认表,不依赖易变的 id)
 3. 与上一份快照对比:新增 / 剔除 / 权重变化 Top5
 4. 邮件发送:HTML 正文 + 当日持仓 CSV 附件
+   正文内容
+   a. 前5大重仓占比
+   b. **算三个真实仓位**：
+    - 正股敞口 ≈ 总正股市值占比
+    - 期货多头敞口 = （合约张数 × 指数点 × 50）/ 基金净值。
+    - 期权空头压力 = （合约张数 × 指数点 × 50）/ 基金净值 × 估算的 Delta。
+   c. 指数现价到行权价的距离。
 5. 全程日志;失败发告警邮件;同一截止日期不重复发(幂等)
 
 ## 本地运行
@@ -31,7 +38,7 @@ QQ邮箱 → 设置 → 账号 → 开启 IMAP/SMTP → 生成授权码。
 1. 把本目录推到一个(私有)GitHub 仓库。
 2. 仓库 Settings → Secrets and variables → Actions,加这些 Secret:
    `SMTP_HOST` `SMTP_PORT` `SMTP_USER` `SMTP_PASS` `MAIL_FROM` `MAIL_TO`
-3. `.github/workflows/daily.yml` 已配好:工作日香港时间 09:30 自动运行,
+3. `.github/workflows/daily.yml` 已配好:工作日香港时间 11:00 自动运行,
    也可在 Actions 页面点 "Run workflow" 手动测试。
 4. 每日快照会自动提交回仓库,用于次日对比。
 

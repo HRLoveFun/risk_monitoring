@@ -5,9 +5,13 @@ Global X HSCEI Covered Call Active ETF —— 每日持仓抓取 + 邮件日报
 
 流程:
   1. 抓取基金页面 HTML(requests,带超时/重试)
-  2. 解析页面里 id=holdingsList 的持仓表 + 期权敞口表(等价于网页上的 "FULL HOLDINGS .CSV" 按钮)
-  3. 与上一份快照对比,生成摘要(总数 / Top10 / 新增剔除 / 权重变化)
-  4. 通过 SMTP 发邮件(正文 + CSV 附件)
+  2. 解析持仓表(拆正股/衍生品)+ 期权敞口表,并反推基金净值 NAV
+  3. 计算正文内容:
+     a. 前五大重仓
+     b. 三个真实仓位:正股敞口 / 期货多头敞口 / 期权空头压力(Delta 调整)
+     c. 指数现价 → 行权价距离
+     并与上一份快照对比(新增/剔除/权重变化)
+  4. 通过 SMTP 发邮件(HTML 正文 + 完整持仓 CSV 附件)
   5. 全程日志;任一步失败发"失败告警";同一截止日期不重复发(幂等)
 
 依赖: requests, beautifulsoup4, pandas  (邮件用标准库)
@@ -19,10 +23,10 @@ import re
 import sys
 import ssl
 import json
+import math
 import time
 import logging
 import smtplib
-from io import StringIO
 from email.message import EmailMessage
 from datetime import datetime, date
 
@@ -57,6 +61,11 @@ FORCE_SEND = env("FORCE_SEND", "").lower() in ("1", "true", "yes")  # 调试用:
 HTTP_TIMEOUT = 30          # 秒,连接+读取
 HTTP_RETRIES = 3           # 下载失败重试次数
 SMTP_RETRIES = 3           # 发信失败重试次数
+
+# 仓位计算参数
+INDEX_MULTIPLIER = 50.0    # HSCEI 期货/期权合约乘数:每点 HKD$50(页面脚注确认)
+IMPLIED_VOL = float(env("IMPLIED_VOL", "0.22"))  # 估算 Delta 用的假设年化波动率(无市场 IV,只能假设)
+RISK_FREE = 0.0            # 短端无风险利率,近似取 0
 
 # 持仓表必须包含的关键列(对不上就报错,绝不默默算错)
 REQUIRED_COLS = ["Name of Securities", "Exchange Ticker", "Net Assets (%)"]
@@ -159,8 +168,33 @@ def parse_as_of_date(html):
             return None
 
 
+def split_equities(df):
+    """把完整持仓表拆成『正股』和『衍生品行(期货/期权)』。
+
+    正股:Exchange Ticker 形如 `939 HK`(纯数字 + HK);衍生品:期货(HCM6)、
+    期权(名称含 CALL/PUT/FUTURE 或空代码)等。靠代码格式判断,稳。
+    """
+    ticker = df["Exchange Ticker"].astype(str).str.strip()
+    name = df["Name of Securities"].astype(str).str.upper()
+    is_eq = ticker.str.match(r"^\d+\s*HK$") & ~name.str.contains(r"CALL|PUT|FUTURE")
+    return df[is_eq].reset_index(drop=True), df[~is_eq].reset_index(drop=True)
+
+
+def derive_nav(equities):
+    """从正股反推基金总净值:NAV = 市值 / (净资产占比 / 100),取中位数抗异常。"""
+    mv, w = "Market Value (in HKD)", "Net Assets (%)"
+    if mv not in equities.columns or w not in equities.columns:
+        return None
+    valid = equities[(equities[w] > 0) & (equities[mv] > 0)]
+    if valid.empty:
+        return None
+    nav = (valid[mv] / (valid[w] / 100.0)).median()
+    return float(nav) if nav and nav > 0 else None
+
+
 def parse_holdings(html):
-    """解析持仓表 + 期权敞口表,返回 (as_of_date, holdings_df, options_df)。
+    """解析页面,返回结构化字典:
+        {as_of, full, equities, derivatives, options, nav}
 
     说明:页面里持仓表的 id 属性重复(id=holdingsList 又 id=top-ten),
     会让某些解析器混乱;因此这里不靠 id,而是靠"表头列名"来认表 —— 更稳。
@@ -188,18 +222,36 @@ def parse_holdings(html):
     if missing:
         raise ValueError(f"持仓表缺少关键列: {missing};实际列: {list(df.columns)}")
 
-    # 数值列清洗
+    # 持仓表数值列清洗
     for col in df.columns:
         if any(k in col for k in ["Price", "Shares", "Value", "Net Assets", "%"]):
             df[col] = _clean_num(df[col])
-
     df = df[df["Name of Securities"].astype(str).str.strip() != ""].reset_index(drop=True)
     if df.empty:
         raise ValueError("持仓表清洗后无有效数据行")
 
+    # 期权敞口表数值列清洗(解析失败不影响主流程)
+    if not options_df.empty:
+        for col in options_df.columns:
+            if any(k in col for k in ["Notional", "Strike", "Index Price",
+                                      "Days", "Upside", "%"]):
+                options_df[col] = _clean_num(options_df[col])
+
+    equities, derivatives = split_equities(df)
+    nav = derive_nav(equities)
+
     as_of = parse_as_of_date(html)
-    logger.info("解析成功:持仓 %d 行,截止日期 %s", len(df), as_of)
-    return as_of, df, options_df
+    logger.info("解析成功:总行数 %d(正股 %d / 衍生品 %d),NAV≈%s,截止 %s",
+                len(df), len(equities), len(derivatives),
+                f"{nav:,.0f}" if nav else "未知", as_of)
+    return {
+        "as_of": as_of,
+        "full": df,
+        "equities": equities,
+        "derivatives": derivatives,
+        "options": options_df,
+        "nav": nav,
+    }
 
 
 # ----------------------------------------------------------------------------
@@ -240,36 +292,141 @@ def load_previous(as_of):
 
 
 # ----------------------------------------------------------------------------
-# 4. 生成摘要
+# 4. 仓位计算
 # ----------------------------------------------------------------------------
-def build_summary(df, prev_df, as_of, options_df):
-    weight_col = "Net Assets (%)"
-    name_col = "Name of Securities"
-    key_col = "Exchange Ticker"
+def bs_call_delta(S, K, T, sigma, r=RISK_FREE):
+    """Black-Scholes 看涨期权 Delta = N(d1)。无市场 IV,sigma 为假设值。
 
-    total = len(df)
-    weight_sum = df[weight_col].sum()
+    边界:到期(T<=0)或波动率<=0 时退化为内在价值判断(实值=1,虚值=0)。
+    """
+    if not (S and K) or S <= 0 or K <= 0:
+        return None
+    if T <= 0 or sigma <= 0:
+        return 1.0 if S > K else 0.0
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    return 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
 
-    top = df.sort_values(weight_col, ascending=False).head(10)
+
+def compute_positions(data):
+    """算三个『真实仓位』+ 指数现价到行权价的距离。返回普通 dict,值缺失记为 None。"""
+    nav = data["nav"]
+    eq, deriv, opt = data["equities"], data["derivatives"], data["options"]
+    res = {"nav": nav}
+
+    # (1) 正股敞口 = 总正股市值 / NAV
+    mv = "Market Value (in HKD)"
+    eq_value = float(eq[mv].sum()) if mv in eq.columns else None
+    res["equity_value"] = eq_value
+    res["equity_pct"] = (eq_value / nav * 100) if (nav and eq_value is not None) else None
+
+    # (2) 期货多头敞口 = Σ(合约张数 × 指数点 × 50) / NAV
+    fut_notional = 0.0
+    fut_found = False
+    if {"Number of Shares Held", "Market Price (in HKD)"}.issubset(deriv.columns):
+        fut = deriv[deriv["Name of Securities"].astype(str).str.upper().str.contains("FUTURE")]
+        for _, r in fut.iterrows():
+            contracts = r["Number of Shares Held"]
+            index_pt = r["Market Price (in HKD)"]
+            if pd.notna(contracts) and pd.notna(index_pt):
+                fut_notional += contracts * index_pt * INDEX_MULTIPLIER
+                fut_found = True
+    res["futures_notional"] = fut_notional if fut_found else None
+    res["futures_pct"] = (fut_notional / nav * 100) if (nav and fut_found) else None
+
+    # (3) 期权空头压力 = Σ(名义敞口/NAV × 估算Delta);名义敞口占比页面已给
+    pct_col = "Notional Exposure to NAV (%)"
+    opt_pressure = 0.0
+    opt_rows = []
+    if not opt.empty and pct_col in opt.columns:
+        for _, r in opt.iterrows():
+            S, K = r.get("Index Price"), r.get("Strike")
+            days = r.get("Calendar Days to Expiry")
+            T = (days / 365.0) if pd.notna(days) else 0.0
+            delta = bs_call_delta(S, K, T, IMPLIED_VOL)
+            notional_pct = r.get(pct_col)
+            if pd.notna(notional_pct) and delta is not None:
+                contrib = notional_pct * delta      # 名义占比(空头为负)× delta
+                opt_pressure += contrib
+                opt_rows.append({
+                    "pos": r.get("Option Position"), "delta": delta,
+                    "notional_pct": notional_pct, "contrib": contrib,
+                })
+    res["option_pressure_pct"] = opt_pressure if opt_rows else None
+    res["option_rows"] = opt_rows
+
+    # (c) 指数现价到行权价的距离(去重)
+    dists = []
+    if not opt.empty and {"Strike", "Index Price"}.issubset(opt.columns):
+        seen = set()
+        for _, r in opt.iterrows():
+            S, K, days = r.get("Index Price"), r.get("Strike"), r.get("Calendar Days to Expiry")
+            if pd.notna(S) and pd.notna(K) and S > 0:
+                key = (round(float(K), 2), round(float(S), 2))
+                if key in seen:
+                    continue
+                seen.add(key)
+                dists.append({"index": S, "strike": K,
+                              "dist_pct": (K - S) / S * 100,
+                              "days": int(days) if pd.notna(days) else None})
+    res["strike_distances"] = dists
+    return res
+
+
+# ----------------------------------------------------------------------------
+# 5. 生成邮件正文
+# ----------------------------------------------------------------------------
+def build_summary(data, prev_full):
+    eq = data["equities"]
+    as_of = data["as_of"]
+    weight_col, name_col, key_col = "Net Assets (%)", "Name of Securities", "Exchange Ticker"
+
+    # ---- a. 前5大重仓 ----
+    top = eq.sort_values(weight_col, ascending=False).head(5)
     top_rows = "".join(
         f"<tr><td>{i}</td><td>{r[name_col]}</td><td>{r[key_col]}</td>"
         f"<td style='text-align:right'>{r[weight_col]:.2f}%</td></tr>"
         for i, (_, r) in enumerate(top.iterrows(), 1)
     )
 
-    # 与上一份对比
+    # ---- b. 三个真实仓位 ----
+    p = compute_positions(data)
+
+    def pct(v):
+        return "N/A" if v is None else f"{v:.2f}%"
+
+    pos_rows = (
+        f"<tr><td>正股敞口</td><td style='text-align:right'>{pct(p['equity_pct'])}</td>"
+        f"<td>≈ 总正股市值 / 基金净值</td></tr>"
+        f"<tr><td>期货多头敞口</td><td style='text-align:right'>{pct(p['futures_pct'])}</td>"
+        f"<td>合约张数 × 指数点 × {INDEX_MULTIPLIER:.0f} / 净值</td></tr>"
+        f"<tr><td>期权空头压力(Delta调整)</td><td style='text-align:right'>{pct(p['option_pressure_pct'])}</td>"
+        f"<td>Σ 名义占比 × 估算Delta(IV={IMPLIED_VOL:.0%})</td></tr>"
+    )
+    net_directional = None
+    if None not in (p["equity_pct"], p["futures_pct"], p["option_pressure_pct"]):
+        net_directional = p["equity_pct"] + p["futures_pct"] + p["option_pressure_pct"]
+    net_html = ("" if net_directional is None else
+                f"<p><b>净方向性敞口(正股+期货+期权Delta)≈ {net_directional:.2f}%</b></p>")
+
+    # ---- c. 指数现价 → 行权价距离 ----
+    dist_rows = "".join(
+        f"<tr><td style='text-align:right'>{d['index']:,.0f}</td>"
+        f"<td style='text-align:right'>{d['strike']:,.0f}</td>"
+        f"<td style='text-align:right'>{d['dist_pct']:+.2f}%</td>"
+        f"<td style='text-align:right'>{d['days'] if d['days'] is not None else 'N/A'}</td></tr>"
+        for d in p["strike_distances"]
+    ) or "<tr><td colspan=4>无期权数据</td></tr>"
+
+    # ---- 与上一交易日对比(只比正股)----
     changes_html = "<p>首次运行,无历史快照可对比。</p>"
-    if prev_df is not None and key_col in prev_df.columns:
-        prev_df = prev_df.copy()
-        prev_df[weight_col] = pd.to_numeric(prev_df[weight_col], errors="coerce")
-        cur_keys = set(df[key_col])
-        prev_keys = set(prev_df[key_col])
-
-        added = df[df[key_col].isin(cur_keys - prev_keys)]
-        removed = prev_df[prev_df[key_col].isin(prev_keys - cur_keys)]
-
-        merged = df.merge(prev_df[[key_col, weight_col]], on=key_col,
-                          suffixes=("", "_prev"))
+    if prev_full is not None and key_col in prev_full.columns:
+        prev_eq, _ = split_equities(prev_full)
+        prev_eq = prev_eq.copy()
+        prev_eq[weight_col] = pd.to_numeric(prev_eq[weight_col], errors="coerce")
+        cur_keys, prev_keys = set(eq[key_col]), set(prev_eq[key_col])
+        added = eq[eq[key_col].isin(cur_keys - prev_keys)]
+        removed = prev_eq[prev_eq[key_col].isin(prev_keys - cur_keys)]
+        merged = eq.merge(prev_eq[[key_col, weight_col]], on=key_col, suffixes=("", "_prev"))
         merged["delta"] = merged[weight_col] - merged[weight_col + "_prev"]
         movers = merged.reindex(merged["delta"].abs().sort_values(ascending=False).index).head(5)
 
@@ -283,44 +440,51 @@ def build_summary(df, prev_df, as_of, options_df):
             for _, r in movers.iterrows() if pd.notna(r["delta"]) and abs(r["delta"]) > 0
         )
         changes_html = (
-            f"<p><b>新增持仓:</b>{names(added)}</p>"
-            f"<p><b>剔除持仓:</b>{names(removed)}</p>"
+            f"<p><b>新增正股:</b>{names(added)}</p>"
+            f"<p><b>剔除正股:</b>{names(removed)}</p>"
             f"<p><b>权重变化最大(Top5):</b></p>"
             f"<table border='1' cellspacing='0' cellpadding='4'>"
             f"<tr><th>名称</th><th>前次</th><th>本次</th><th>变化</th></tr>"
             f"{movers_rows or '<tr><td colspan=4>无明显变化</td></tr>'}</table>"
         )
 
-    # 权重合计异常提示
-    warn = ""
-    if not (95 <= weight_sum <= 105):
-        warn = (f"<p style='color:#c00'><b>⚠ 注意:股票持仓权重合计 {weight_sum:.2f}%,"
-                f"偏离 100%(该基金为备兑看涨策略,含期权空头敞口,属正常;仅供留意)。</b></p>")
-
-    options_html = ""
-    if options_df is not None and not options_df.empty:
-        options_html = "<h3>期权敞口</h3>" + options_df.to_html(index=False, border=1)
-
+    nav_str = f"{p['nav']:,.0f} HKD" if p["nav"] else "未知"
     as_of_str = as_of.strftime("%Y-%m-%d") if as_of else "未知"
     body = f"""\
 <html><body style="font-family:Arial,'Microsoft YaHei',sans-serif;font-size:14px">
 <h2>{FUND_NAME} 每日持仓日报</h2>
-<p><b>持仓截止日期:</b>{as_of_str} &nbsp;|&nbsp; <b>持仓数量:</b>{total} &nbsp;|&nbsp;
-   <b>股票权重合计:</b>{weight_sum:.2f}%</p>
-{warn}
-<h3>前十大持仓</h3>
+<p><b>持仓截止日期:</b>{as_of_str} &nbsp;|&nbsp; <b>正股数量:</b>{len(eq)} &nbsp;|&nbsp;
+   <b>基金净值(估):</b>{nav_str}</p>
+
+<h3>a. 前五大重仓</h3>
 <table border="1" cellspacing="0" cellpadding="4">
 <tr><th>#</th><th>名称</th><th>代码</th><th>权重</th></tr>
 {top_rows}
 </table>
-<h3>较上一交易日变化</h3>
+
+<h3>b. 三个真实仓位</h3>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th>仓位</th><th>占净值</th><th>算法</th></tr>
+{pos_rows}
+</table>
+{net_html}
+
+<h3>c. 指数现价 → 行权价距离</h3>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th>指数现价</th><th>行权价</th><th>距离</th><th>剩余天数</th></tr>
+{dist_rows}
+</table>
+
+<h3>较上一交易日变化(正股)</h3>
 {changes_html}
-{options_html}
-<p style="color:#888;font-size:12px">数据来源:{FUND_URL}<br>
-本邮件由脚本自动生成于 {datetime.now():%Y-%m-%d %H:%M:%S}。</p>
+
+<p style="color:#888;font-size:12px">
+注:Delta 为假设波动率 IV={IMPLIED_VOL:.0%} 下的 Black-Scholes 估算值,仅供参考;
+NAV 由"市值/权重"反推。完整持仓见附件 CSV。<br>
+数据来源:{FUND_URL}<br>本邮件由脚本自动生成于 {datetime.now():%Y-%m-%d %H:%M:%S}。</p>
 </body></html>"""
 
-    subject = f"[ETF日报] {FUND_NAME} 持仓 {as_of_str}({total}只)"
+    subject = f"[ETF日报] {FUND_NAME} 持仓 {as_of_str}(正股{len(eq)}只)"
     return subject, body
 
 
@@ -415,15 +579,16 @@ def main():
     logger.info("===== 任务开始 =====")
     try:
         html = fetch_page(FUND_URL)
-        as_of, df, options_df = parse_holdings(html)
+        data = parse_holdings(html)
+        as_of = data["as_of"]
 
         if already_sent(as_of):
             logger.info("截止日期 %s 已发送过,跳过(可设 FORCE_SEND=1 强制发送)", as_of)
             return 0
 
-        prev_df = load_previous(as_of)
-        path = save_snapshot(df, as_of)
-        subject, body = build_summary(df, prev_df, as_of, options_df)
+        prev_full = load_previous(as_of)
+        path = save_snapshot(data["full"], as_of)   # 附件存完整持仓(含衍生品),与官网导出一致
+        subject, body = build_summary(data, prev_full)
         send_email(subject, body, attachments=[path])
         mark_sent(as_of)
         logger.info("===== 任务成功 =====")
