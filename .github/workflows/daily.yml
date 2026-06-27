@@ -2,8 +2,8 @@ name: daily-holdings
 
 on:
   schedule:
-    # GitHub 用 UTC。01:30 UTC = 香港时间 09:30,工作日运行。
-    - cron: "30 1 * * 1-5"
+    # GitHub 用 UTC。03:00 UTC = 香港时间 11:00,周一至周五运行。
+    - cron: "0 3 * * 1-5"
   workflow_dispatch: {}   # 允许在网页上手动点一下触发(方便测试)
 
 # 允许把每日快照提交回仓库(供"日间对比"用,否则跑完即丢)
@@ -14,9 +14,9 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
