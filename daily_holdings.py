@@ -7,9 +7,9 @@ Global X HSCEI Covered Call Active ETF —— 每日持仓抓取 + 邮件日报
   1. 抓取基金页面 HTML(requests,带超时/重试/内容校验)
   2. 解析持仓表(拆正股/衍生品)+ 期权敞口表,并由「市值 ÷ 权重」反推基金净值 NAV
   3. 计算邮件正文:
-     a. 前五大重仓(标题含合计占比)
-     b. 风险暴露:正股敞口 / 期货多头敞口 / 期权空头敞口
+     a. 风险暴露:正股敞口 / 期货多头敞口 / 期权空头敞口
         (期权同列「名义口径」与「Delta 调整后」两个值)
+     b. 前五大重仓(标题含合计占比)
      c. 指数现价 → 行权价距离
      并与上一份快照对比(新增/剔除/权重变化,仅正股)
   4. 通过 SMTP 发邮件(主题「YYYYMMDD <FUND_NAME> 持仓」+ HTML 正文 + 完整持仓 CSV 附件)
@@ -69,7 +69,7 @@ SMTP_RETRIES = 3           # 发信失败重试次数
 
 # 仓位计算参数
 INDEX_MULTIPLIER = 50.0    # HSCEI 期货/期权合约乘数:每点 HKD$50(页面脚注确认)
-IMPLIED_VOL = float(env("IMPLIED_VOL", "0.22"))  # 估算 Delta 用的假设年化波动率(无市场 IV,只能假设)
+IMPLIED_VOL = float(env("IMPLIED_VOL", "0.30"))  # 估算 Delta 用的假设年化波动率(无市场 IV,只能假设)
 RISK_FREE = 0.0            # 短端无风险利率,近似取 0
 
 # 持仓表必须包含的关键列(对不上就报错,绝不默默算错)
@@ -326,6 +326,33 @@ def bs_call_delta(S, K, T, sigma, r=RISK_FREE):
     return 0.5 * (1.0 + math.erf(d1 / math.sqrt(2.0)))
 
 
+def strike_from_name(name):
+    """从期权名称里提取行权价 —— 页面对部分 OTC 期权的 Strike 列填 0,
+    真实行权价只写在名称中(如 'C7700',且常被渲染拆成 'C770 0')。
+
+    优先取 'C<数字>'(Call)或 'P<数字>'(Put)后紧邻 OTC/Call/Put 前的数字;
+    退而取 Call/Put 前的最后一个数字(如 '... 7,700 Call')。数字中的空格/逗号一律去掉。
+    """
+    if not name:
+        return None
+    s = str(name)
+    m = re.search(r"[CP]\s?([\d][\d ]*?)\s+(?:OTC|Call|Put)", s)
+    if not m:
+        m = re.search(r"([\d,]{3,})\s+(?:OTC\s+)?(?:Call|Put)", s)
+    if not m:
+        return None
+    digits = re.sub(r"\D", "", m.group(1))
+    return float(digits) if digits else None
+
+
+def option_strike(r):
+    """取期权行权价:优先用 Strike 列;缺失或为 0 时回退到名称解析。"""
+    k = r.get("Strike")
+    if pd.notna(k) and float(k) > 0:
+        return float(k)
+    return strike_from_name(r.get("Option Position"))
+
+
 def compute_positions(data):
     """算三个『真实仓位』+ 指数现价到行权价的距离。返回普通 dict,值缺失记为 None。"""
     nav = data["nav"]
@@ -359,7 +386,7 @@ def compute_positions(data):
     opt_rows = []
     if not opt.empty and pct_col in opt.columns:
         for _, r in opt.iterrows():
-            S, K = r.get("Index Price"), r.get("Strike")
+            S, K = r.get("Index Price"), option_strike(r)
             days = r.get("Calendar Days to Expiry")
             T = (days / 365.0) if pd.notna(days) else 0.0
             delta = bs_call_delta(S, K, T, IMPLIED_VOL)
@@ -378,10 +405,10 @@ def compute_positions(data):
 
     # (c) 指数现价到行权价的距离(去重)
     dists = []
-    if not opt.empty and {"Strike", "Index Price"}.issubset(opt.columns):
+    if not opt.empty and "Index Price" in opt.columns:
         seen = set()
         for _, r in opt.iterrows():
-            S, K, days = r.get("Index Price"), r.get("Strike"), r.get("Calendar Days to Expiry")
+            S, K, days = r.get("Index Price"), option_strike(r), r.get("Calendar Days to Expiry")
             if pd.notna(S) and pd.notna(K) and S > 0:
                 key = (round(float(K), 2), round(float(S), 2))
                 if key in seen:
@@ -473,25 +500,24 @@ def build_summary(data, prev_full):
             f"{movers_rows or '<tr><td colspan=4>无明显变化</td></tr>'}</table>"
         )
 
-    nav_str = f"{p['nav']:,.0f} HKD" if p["nav"] else "未知"
     as_of_str = as_of.strftime("%Y-%m-%d") if as_of else "未知"
     body = f"""\
 <html><body style="font-family:Arial,'Microsoft YaHei',sans-serif;font-size:14px">
 <h2>{FUND_NAME} 每日持仓日报</h2>
-<p><b>持仓截止日期:</b>{as_of_str} &nbsp;|&nbsp; <b>基金净值(估):</b>{nav_str}</p>
+<p><b>持仓截止日期:</b>{as_of_str}</p>
 
-<h3>a. 前五大重仓占比 {top5_pct:.2f}%</h3>
-<table border="1" cellspacing="0" cellpadding="4">
-<tr><th>#</th><th>名称</th><th>代码</th><th>权重</th></tr>
-{top_rows}
-</table>
-
-<h3>b. 风险暴露</h3>
+<h3>a. 风险暴露</h3>
 <table border="1" cellspacing="0" cellpadding="4">
 <tr><th>仓位</th><th>名义占净值</th><th>Delta调整后</th><th>算法</th></tr>
 {pos_rows}
 </table>
 {net_html}
+
+<h3>b. 前五大重仓占比 {top5_pct:.2f}%</h3>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th>#</th><th>名称</th><th>代码</th><th>权重</th></tr>
+{top_rows}
+</table>
 
 <h3>c. 指数现价 → 行权价距离</h3>
 <table border="1" cellspacing="0" cellpadding="4">
