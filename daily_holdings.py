@@ -7,10 +7,10 @@ Global X HSCEI Covered Call Active ETF —— 每日持仓抓取 + 邮件日报
   1. 抓取基金页面 HTML(requests,带超时/重试/内容校验)
   2. 解析持仓表(拆正股/衍生品)+ 期权敞口表,并由「市值 ÷ 权重」反推基金净值 NAV
   3. 计算邮件正文:
-     a. 风险暴露:正股敞口 / 期货多头敞口 / 期权空头敞口
+     a. 指数现价 → 行权价距离
+     b. 风险暴露:正股敞口 / 期货多头敞口 / 期权空头敞口
         (期权同列「名义口径」与「Delta 调整后」两个值)
-     b. 前五大重仓(标题含合计占比)
-     c. 指数现价 → 行权价距离
+     c. 前五大重仓(标题含合计占比)
      并与上一份快照对比(新增/剔除/权重变化,仅正股)
   4. 通过 SMTP 发邮件(主题「YYYYMMDD <FUND_NAME> 持仓」+ HTML 正文 + 完整持仓 CSV 附件)
   5. 全程日志;任一步失败发"失败告警"
@@ -506,23 +506,23 @@ def build_summary(data, prev_full):
 <h2>{FUND_NAME} 每日持仓日报</h2>
 <p><b>持仓截止日期:</b>{as_of_str}</p>
 
-<h3>a. 风险暴露</h3>
+<h3>a. 指数现价 → 行权价距离</h3>
+<table border="1" cellspacing="0" cellpadding="4">
+<tr><th>指数现价</th><th>行权价</th><th>距离</th><th>剩余天数</th></tr>
+{dist_rows}
+</table>
+
+<h3>b. 风险暴露</h3>
 <table border="1" cellspacing="0" cellpadding="4">
 <tr><th>仓位</th><th>名义占净值</th><th>Delta调整后</th><th>算法</th></tr>
 {pos_rows}
 </table>
 {net_html}
 
-<h3>b. 前五大重仓占比 {top5_pct:.2f}%</h3>
+<h3>c. 前五大重仓占比 {top5_pct:.2f}%</h3>
 <table border="1" cellspacing="0" cellpadding="4">
 <tr><th>#</th><th>名称</th><th>代码</th><th>权重</th></tr>
 {top_rows}
-</table>
-
-<h3>c. 指数现价 → 行权价距离</h3>
-<table border="1" cellspacing="0" cellpadding="4">
-<tr><th>指数现价</th><th>行权价</th><th>距离</th><th>剩余天数</th></tr>
-{dist_rows}
 </table>
 
 <h3>较上一交易日变化(正股)</h3>
