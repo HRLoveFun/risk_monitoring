@@ -10,8 +10,10 @@ Global X HSCEI Covered Call Active ETF —— 每日持仓抓取 + 邮件日报
      a. 指数现价 → 行权价距离
      b. 风险暴露:正股敞口 / 期货多头敞口 / 期权空头敞口
         (期权同列「名义口径」与「Delta 调整后」两个值)
-     c. 前五大重仓(标题含合计占比)
-     并与上一份快照对比(新增/剔除/权重变化,仅正股)
+      c. 前五大重仓(标题含合计占比)
+      d. 较上一交易日差异:汇总指标(NAV/指数收盘/正股市值/期货名义)、
+         正股新增/剔除/权重变化(≥0.1pp)、期货与期权逐腿新增/剔除/张数变化。
+         差异只如实罗列,不推断原始数据的对错
   4. 通过 SMTP 发邮件(主题「YYYYMMDD <FUND_NAME> 持仓」+ HTML 正文 + 完整持仓 CSV 附件)
   5. 全程日志;任一步失败发"失败告警"
 
@@ -25,11 +27,14 @@ Global X HSCEI Covered Call Active ETF —— 每日持仓抓取 + 邮件日报
       这让脚本可以被高频触发(如每 10 分钟):没更新就跳过,更新了就发一封。
       调试可设 FORCE_SEND=1 强制发送。
 
-数据未就绪:官网存在「先放正股、稍后才补期货/期权行」的分阶段发布。此时直接发信会得到
-      一份没有衍生品的残缺日报,且因幂等再也不会重发。故:
-        - 缺衍生品 → 判定未就绪,不发信也不写幂等标记,等下次触发(每 10 分钟);
-        - 超过 INCOMPLETE_GRACE_HOURS 仍不全 → 先发一封带醒目警告的日报兜底;
-        - 之后数据补全 → 自动补发一封「【更新】」版(每个截止日最多补发一次)。
+分阶段发布:官网存在「先放正股、稍后才补期货/期权行」的分阶段发布。是否等待只看
+      「与前一日快照对比」的硬信号 —— 整类工具消失(如昨日期货/期权合约行 >0、今日为 0)
+      或关键计算前提缺失(腿无法计算、缺指数点位):
+        - 命中且"等一等可能就好" → 先不发信也不写幂等标记,等下次触发(每 10 分钟);
+        - 超过 INCOMPLETE_GRACE_HOURS → 先发一封【待补全】日报兜底;
+        - 之后数据补齐 → 自动补发一封「【更新】」版(每个截止日最多补发一次)。
+      其余一切数量变化(腿数增减、换仓滚动、张数变化等)不拦截、不下对错结论,
+      只如实列入日报的「较上一交易日差异」。
 
 依赖: requests, beautifulsoup4, pandas  (邮件用标准库)
 配置: 全部走环境变量,见 .env.example
@@ -87,13 +92,8 @@ RISK_FREE = 0.0            # 短端无风险利率,近似取 0
 
 # 页面「分阶段发布」宽限:判定数据未就绪后最多等这么久,超时就先发带警告的日报兜底
 INCOMPLETE_GRACE_HOURS = float(env("INCOMPLETE_GRACE_HOURS", "3"))
-# 持仓表算出的期权名义敞口 与 官网期权敞口表 差异超过这个百分点就判为"漏腿"(交叉校验)。
-# 页面占比按 0.01pp 取整,几条腿的舍入噪声上限约 0.05pp,所以 0.3pp 已经远高于噪声。
-CROSS_CHECK_TOL_PP = 0.3
-# 期权行数少于基准快照时的「换仓」判定容差。同指数同乘数下名义 ∝ |张数|,
-# 总张数缩水 ≤1% 视为与基准持平 → 判为换仓(如周度期权到期滚入月度腿)而非缺数据。
-# 张数是精确整数,仓位不动时分毫不变;真正的整腿丢失通常远超 1%,不会漏报。
-NOTIONAL_MATCH_TOL = 0.01
+# 「较上一交易日差异」里,正股权重变化小于该值(百分点)的不列出。
+WEIGHT_DIFF_TOL_PP = 0.10
 
 # 持仓表必须包含的关键列(对不上就报错,绝不默默算错)
 REQUIRED_COLS = ["Name of Securities", "Exchange Ticker", "Net Assets (%)"]
@@ -403,7 +403,7 @@ def futures_legs(derivatives):
             continue
         contracts, index_pt = r.get("Number of Shares Held"), r.get("Market Price (in HKD)")
         if pd.isna(contracts) or pd.isna(index_pt):
-            logger.warning("期货行数据不全,跳过:%s", nm)
+            logger.warning("期货行张数/指数点缺失,跳过:%s", nm)
             continue
         legs.append({"name": str(nm), "contracts": float(contracts),
                      "index_pt": float(index_pt)})
@@ -505,15 +505,34 @@ def snapshot_path(as_of):
     return os.path.join(DATA_DIR, f"holdings_{tag}.csv")
 
 
-def save_snapshot(df, as_of):
+def snapshot_meta_path(as_of):
+    tag = as_of.strftime("%Y%m%d") if as_of else date.today().strftime("%Y%m%d")
+    return os.path.join(DATA_DIR, f"holdings_{tag}.meta.json")
+
+
+def save_snapshot(df, as_of, meta=None):
     path = snapshot_path(as_of)
     df.to_csv(path, index=False, encoding="utf-8-sig")  # utf-8-sig 便于 Excel 直接打开
     logger.info("已存档: %s", path)
+    # 附带一份当日汇总指标元数据,供次日的「较上一交易日差异」引用。
+    # 持仓 CSV 本身不含 NAV/指数点位;旧快照没有 meta 文件时对应项显示 N/A。
+    if meta is not None:
+        try:
+            meta_path = snapshot_meta_path(as_of)
+            with open(meta_path, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False)
+            logger.info("已存档元数据: %s", meta_path)
+        except Exception as e:
+            logger.warning("元数据存档失败(忽略,不影响主流程): %s", e)
     return path
 
 
 def load_previous(as_of):
-    """找比当前截止日期更早的最近一份快照,用于对比;没有则返回 None。"""
+    """找比当前截止日期更早的最近一份快照及其元数据,用于对比。
+
+    返回 (DataFrame, dict 或 None);没有任何历史快照时返回 (None, None)。
+    元数据缺失(旧版快照)不影响对比,只是汇总指标里 NAV/指数点位显示 N/A。
+    """
     cur = snapshot_path(as_of)
     files = []
     for f in os.listdir(DATA_DIR):
@@ -523,15 +542,172 @@ def load_previous(as_of):
             if full != cur:
                 files.append((m.group(1), full))
     if not files:
-        return None
+        return None, None
     files.sort()
-    prev_path = files[-1][1]
+    _, prev_path = files[-1]
+    prev_meta = None
+    try:
+        with open(prev_path[:-4] + ".meta.json", encoding="utf-8") as f:
+            prev_meta = json.load(f)
+    except Exception:
+        pass
     try:
         logger.info("对比基准: %s", prev_path)
-        return pd.read_csv(prev_path)
+        return pd.read_csv(prev_path), prev_meta
     except Exception as e:
         logger.warning("读取上一份快照失败(忽略对比): %s", e)
-        return None
+        return None, None
+
+
+def _norm_label(s):
+    return " ".join(str(s or "").split())
+
+
+def _num_series(df, col):
+    """按列取数值;列不存在时返回全 None 的 Series。"""
+    if col not in df.columns:
+        return pd.Series([None] * len(df), index=df.index)
+    return pd.to_numeric(df[col], errors="coerce")
+
+
+def diff_vs_previous(prev_full, prev_meta, cur_full, cur):
+    """把当天完整持仓表与前一日快照逐项对比 —— 只列出显著不同,不对错下结论。
+
+    对齐方式:正股按 Exchange Ticker;期货按归一化后的合约名称;
+    期权按 (行权价, 到期日)(由合约名称解析;同一合约拆成多行的先合并张数)。
+    换仓滚动(周度到期滚入月度)自然呈现为「一剔除一新增」,不加任何解读。
+
+    参数:prev_full/cur_full 为完整持仓表 DataFrame;prev_meta 为前日快照元数据
+    (旧快照可能没有);cur 为当天的 {nav, index_close}。
+    返回结构化 dict,任何一节缺数据都安全降级(N/A / 空列表)。
+    """
+    diff = {
+        "has_prev": prev_full is not None and not prev_full.empty,
+        "equities": {"added": [], "removed": [], "weight_changes": []},
+        "futures": {"added": [], "removed": [], "changed": [],
+                    "rows_prev": 0, "rows_cur": 0},
+        "options": {"added": [], "removed": [], "changed": [],
+                    "rows_prev": 0, "rows_cur": 0,
+                    "contracts_abs_prev": None, "contracts_abs_cur": None},
+        "metrics": [],
+    }
+    if cur_full is None or cur_full.empty or "Name of Securities" not in cur_full.columns:
+        return diff
+    prev_eq = prev_deriv = None
+    if diff["has_prev"] and "Name of Securities" in prev_full.columns:
+        prev_eq, prev_deriv, _ = split_equities(prev_full)
+    cur_eq, cur_deriv, _ = split_equities(cur_full)
+
+    # ---- 正股 ----
+    def equity_map(eq):
+        out = {}
+        if eq is None or eq.empty:
+            return out
+        wts = _num_series(eq, "Net Assets (%)")
+        for (_, r), wt in zip(eq.iterrows(), wts):
+            key = str(r.get("Exchange Ticker", "")).strip()
+            if key:
+                out[key] = {"name": str(r.get("Name of Securities")),
+                            "weight": None if pd.isna(wt) else float(wt)}
+        return out
+
+    emap_cur, emap_prev = equity_map(cur_eq), equity_map(prev_eq)
+    eq = diff["equities"]
+    for k in sorted(emap_cur.keys() - emap_prev.keys()):
+        v = emap_cur[k]
+        eq["added"].append((v["name"], k, v["weight"]))
+    for k in sorted(emap_prev.keys() - emap_cur.keys()):
+        v = emap_prev[k]
+        eq["removed"].append((v["name"], k, v["weight"]))
+    for k in sorted(set(emap_cur) & set(emap_prev)):
+        pw, cw = emap_prev[k]["weight"], emap_cur[k]["weight"]
+        if pw is not None and cw is not None and abs(cw - pw) >= WEIGHT_DIFF_TOL_PP:
+            eq["weight_changes"].append(
+                {"name": emap_cur[k]["name"], "ticker": k,
+                 "prev": pw, "cur": cw, "delta": cw - pw})
+    eq["weight_changes"].sort(key=lambda d: abs(d["delta"]), reverse=True)
+
+    # ---- 衍生品(期货/期权):先归一成 {对齐键: 行},再比集合 ----
+    def deriv_rows(d):
+        out = {}
+        if d is None or d.empty or "Name of Securities" not in d.columns:
+            return out
+        cons = _num_series(d, "Number of Shares Held")
+        pxs = _num_series(d, "Market Price (in HKD)")
+        for (_, r), c, px in zip(d.iterrows(), cons, pxs):
+            nm = _norm_label(r.get("Name of Securities"))
+            if not nm:
+                continue
+            con = None if pd.isna(c) else float(c)
+            price = None if pd.isna(px) else float(px)
+            if is_option(nm):
+                strike, expiry = parse_option_name(nm)
+                key = ("OPT", strike, str(expiry))
+            elif is_future(nm):
+                key = ("FUT", nm)
+            else:
+                key = ("UNK", nm)
+            if key in out:                      # 同一合约拆成多行的,合并张数
+                base = out[key]
+                base["contracts"] = ((base["contracts"] or 0.0)
+                                     + (con or 0.0)) if con is not None else base["contracts"]
+            else:
+                out[key] = {"label": nm, "contracts": con, "price": price}
+        return out
+
+    dmap_prev, dmap_cur = deriv_rows(prev_deriv), deriv_rows(cur_deriv)
+    for kind, sec in (("FUT", "futures"), ("OPT", "options")):
+        kp = {k for k in dmap_prev if k[0] == kind}
+        kc = {k for k in dmap_cur if k[0] == kind}
+        s = diff[sec]
+        s["rows_prev"], s["rows_cur"] = len(kp), len(kc)
+        for k in sorted(kc - kp, key=str):
+            s["added"].append(dict(dmap_cur[k]))
+        for k in sorted(kp - kc, key=str):
+            s["removed"].append(dict(dmap_prev[k]))
+        for k in sorted(kp & kc, key=str):
+            pc, cc = dmap_prev[k]["contracts"], dmap_cur[k]["contracts"]
+            if pc != cc:                        # 任一侧缺失或数值不同都算变化
+                s["changed"].append({"label": dmap_cur[k]["label"], "prev": pc, "cur": cc})
+
+    def abs_contracts(dmap, kind):
+        vals = [v["contracts"] for k, v in dmap.items()
+                if k[0] == kind and v["contracts"] is not None]
+        return float(sum(abs(v) for v in vals)) if vals else None
+
+    diff["options"]["contracts_abs_prev"] = abs_contracts(dmap_prev, "OPT")
+    diff["options"]["contracts_abs_cur"] = abs_contracts(dmap_cur, "OPT")
+
+    # ---- 汇总指标(前日值来自快照元数据,旧快照没有则为 N/A)----
+    def mv_sum(eqd):
+        if eqd is None or eqd.empty:
+            return None
+        s = _num_series(eqd, "Market Value (in HKD)").dropna()
+        return float(s.sum()) if not s.empty else None
+
+    def fut_notional(dmap):
+        tot, seen = 0.0, False
+        for k, v in dmap.items():
+            if (k[0] == "FUT" and v["contracts"] is not None
+                    and v.get("price") is not None):
+                tot += v["contracts"] * v["price"] * INDEX_MULTIPLIER
+                seen = True
+        return tot if seen else None
+
+    pm = prev_meta if isinstance(prev_meta, dict) else {}
+    diff["metrics"] = [
+        {"label": "基金净值 NAV(HKD)", "prev": pm.get("nav"),
+         "cur": cur.get("nav"), "fmt": ",.0f"},
+        {"label": "HSCEI 收盘", "prev": pm.get("index_close"),
+         "cur": cur.get("index_close"), "fmt": ",.2f"},
+        {"label": "正股市值合计(HKD)", "prev": mv_sum(prev_eq),
+         "cur": mv_sum(cur_eq), "fmt": ",.0f"},
+        {"label": "期货名义合计(HKD)", "prev": fut_notional(dmap_prev),
+         "cur": fut_notional(dmap_cur), "fmt": ",.0f"},
+        {"label": "期权空头总张数(绝对值)", "prev": diff["options"]["contracts_abs_prev"],
+         "cur": diff["options"]["contracts_abs_cur"], "fmt": ",.0f"},
+    ]
+    return diff
 
 
 # ----------------------------------------------------------------------------
@@ -665,21 +841,15 @@ def compute_positions(data):
     res["iv_avg"] = (iv_used / iv_weight) if iv_weight else None
     res["iv_all_from_market"] = bool(opt_rows) and all(r["iv_src"] == "市价反解" for r in opt_rows)
 
-    # 交叉校验:和官网「期权敞口表」的名义占比合计对一对。
-    # 这是"漏了一条腿"最灵敏的探针 —— 结果放进 res 交给 check_readiness,
-    # 只写日志没用:CI 的 run.log 既被 gitignore 又随 runner 销毁,没人看得到。
+    # 官网「期权敞口表」与持仓表是同一页面的两个来源,这里只把两个数字并排列出
+    # 供人工对照,不设阈值、不下"漏腿/不符"的结论;两个数都会随日报正文发出。
     page_pct = _option_exposure_from_page(data["options"])
     res["option_notional_pct_page"] = page_pct
     res["cross_check_gap"] = None
     if page_pct is not None and opt_rows:
-        gap = abs(page_pct - opt_notional_pct)
-        res["cross_check_gap"] = gap
-        if gap > CROSS_CHECK_TOL_PP:
-            logger.warning("期权名义敞口交叉校验不一致:持仓表算得 %.2f%%,官网敞口表 %.2f%%"
-                           "(差 %.2f 个百分点)", opt_notional_pct, page_pct, gap)
-        else:
-            logger.info("期权名义敞口交叉校验通过:持仓表 %.2f%% vs 官网敞口表 %.2f%%",
-                        opt_notional_pct, page_pct)
+        res["cross_check_gap"] = abs(page_pct - opt_notional_pct)
+        logger.info("期权名义敞口两来源并列:持仓表逐腿加总 %.2f%% vs 官网敞口表 %.2f%%",
+                    opt_notional_pct, page_pct)
 
     # (a) 指数现价到行权价的距离(按 行权价+到期日 去重)
     dists, seen = [], set()
@@ -699,7 +869,7 @@ def compute_positions(data):
 # ----------------------------------------------------------------------------
 # 5. 生成邮件正文
 # ----------------------------------------------------------------------------
-def build_summary(data, prev_full, positions=None, blocking=None, warnings=None,
+def build_summary(data, diff, positions=None, blocking=None, warnings=None,
                   update_mode=False):
     """生成 (主题, HTML 正文)。blocking/warnings 非空时在正文顶部挂告警条。"""
     blocking, warnings = list(blocking or []), list(warnings or [])
@@ -753,38 +923,76 @@ def build_summary(data, prev_full, positions=None, blocking=None, warnings=None,
         for d in p["strike_distances"]
     ) or "<tr><td colspan=4>无期权数据</td></tr>"
 
-    # ---- 与上一交易日对比(只比正股)----
+    # ---- 较上一交易日差异(只列事实,不下对错结论)----
+    def _fmt_val(v, fmt):
+        return "N/A" if v is None else format(v, fmt)
+
+    def _fmt_contracts(v):
+        if v is None:
+            return "—"
+        return f"{v:,.0f}" if float(v).is_integer() else f"{v:,.2f}"
+
     changes_html = "<p>首次运行,无历史快照可对比。</p>"
-    if prev_full is not None and key_col in prev_full.columns:
-        prev_eq, _, _ = split_equities(prev_full)
-        prev_eq = prev_eq.copy()
-        prev_eq[weight_col] = pd.to_numeric(prev_eq[weight_col], errors="coerce")
-        cur_keys, prev_keys = set(eq[key_col]), set(prev_eq[key_col])
-        added = eq[eq[key_col].isin(cur_keys - prev_keys)]
-        removed = prev_eq[prev_eq[key_col].isin(prev_keys - cur_keys)]
-        merged = eq.merge(prev_eq[[key_col, weight_col]], on=key_col, suffixes=("", "_prev"))
-        merged["delta"] = merged[weight_col] - merged[weight_col + "_prev"]
-        movers = merged.reindex(merged["delta"].abs().sort_values(ascending=False).index).head(5)
+    if diff and diff.get("has_prev"):
+        eq_d, fu_d, op_d = diff["equities"], diff["futures"], diff["options"]
 
-        def names(d):
-            return ", ".join(d[name_col].astype(str)) if len(d) else "无"
+        def names(items):
+            if not items:
+                return "无"
+            return ", ".join(f"{n}({k})" for n, k, *_ in items)
 
-        movers_rows = "".join(
-            f"<tr><td>{r[name_col]}</td><td style='text-align:right'>{r[weight_col + '_prev']:.2f}%</td>"
-            f"<td style='text-align:right'>{r[weight_col]:.2f}%</td>"
-            f"<td style='text-align:right'>{r['delta']:+.2f}%</td></tr>"
-            for _, r in movers.iterrows() if pd.notna(r["delta"]) and abs(r["delta"]) > 0
+        metric_rows = "".join(
+            f"<tr><td>{m['label']}</td>"
+            f"<td style='text-align:right'>{_fmt_val(m['prev'], m['fmt'])}</td>"
+            f"<td style='text-align:right'>{_fmt_val(m['cur'], m['fmt'])}</td></tr>"
+            for m in diff["metrics"]
         )
+        wc_rows = "".join(
+            f"<tr><td>{d['name']}</td><td>{d['ticker']}</td>"
+            f"<td style='text-align:right'>{d['prev']:.2f}%</td>"
+            f"<td style='text-align:right'>{d['cur']:.2f}%</td>"
+            f"<td style='text-align:right'>{d['delta']:+.2f}%</td></tr>"
+            for d in eq_d["weight_changes"]
+        ) or f"<tr><td colspan=5>权重变化均 &lt; {WEIGHT_DIFF_TOL_PP:.2f}pp</td></tr>"
+
+        def leg_rows(added, removed, changed):
+            rows = ([(d["label"], "—", _fmt_contracts(d.get("contracts")), "新增")
+                     for d in added]
+                    + [(d["label"], _fmt_contracts(d.get("contracts")), "—", "剔除")
+                       for d in removed]
+                    + [(d["label"], _fmt_contracts(d["prev"]),
+                        _fmt_contracts(d["cur"]), "变化") for d in changed])
+            return "".join(
+                f"<tr><td>{lb}</td><td style='text-align:right'>{pv}</td>"
+                f"<td style='text-align:right'>{cv}</td><td>{tag}</td></tr>"
+                for lb, pv, cv, tag in rows
+            ) or "<tr><td colspan=4>无变化</td></tr>"
+
         changes_html = (
-            f"<p><b>新增正股:</b>{names(added)}</p>"
-            f"<p><b>剔除正股:</b>{names(removed)}</p>"
-            f"<p><b>权重变化最大(Top5):</b></p>"
-            f"<table border='1' cellspacing='0' cellpadding='4'>"
-            f"<tr><th>名称</th><th>前次</th><th>本次</th><th>变化</th></tr>"
-            f"{movers_rows or '<tr><td colspan=4>无明显变化</td></tr>'}</table>"
+            "<p><b>汇总指标:</b></p>"
+            "<table border='1' cellspacing='0' cellpadding='4'>"
+            "<tr><th>指标</th><th>前日</th><th>当日</th></tr>"
+            f"{metric_rows}</table>"
+            f"<p><b>正股:</b>新增 {len(eq_d['added'])} 只({names(eq_d['added'])});"
+            f"剔除 {len(eq_d['removed'])} 只({names(eq_d['removed'])})</p>"
+            "<table border='1' cellspacing='0' cellpadding='4'>"
+            f"<tr><th>权重变化(≥{WEIGHT_DIFF_TOL_PP:.2f}pp)</th><th>代码</th>"
+            "<th>前日</th><th>当日</th><th>变化</th></tr>"
+            f"{wc_rows}</table>"
+            f"<p><b>期货合约行:{fu_d['rows_prev']} → {fu_d['rows_cur']} 条</b></p>"
+            "<table border='1' cellspacing='0' cellpadding='4'>"
+            "<tr><th>合约</th><th>前日张数</th><th>当日张数</th><th>备注</th></tr>"
+            f"{leg_rows(fu_d['added'], fu_d['removed'], fu_d['changed'])}</table>"
+            f"<p><b>期权合约行:{op_d['rows_prev']} → {op_d['rows_cur']} 条;"
+            f"空头总张数(绝对值){_fmt_contracts(op_d['contracts_abs_prev'])} → "
+            f"{_fmt_contracts(op_d['contracts_abs_cur'])}</b></p>"
+            "<table border='1' cellspacing='0' cellpadding='4'>"
+            "<tr><th>合约(按行权价/到期日对齐)</th><th>前日张数</th>"
+            "<th>当日张数</th><th>备注</th></tr>"
+            f"{leg_rows(op_d['added'], op_d['removed'], op_d['changed'])}</table>"
         )
 
-    # ---- 顶部告警条:数据不全(红) / 需注意(黄) / 补发更新版(绿)----
+    # ---- 顶部告警条:拦截项(红) / 需注意(黄) / 补发更新版(绿)----
     def _bar(border, bg, fg, title, items, tail=""):
         li = "".join(f"<li>{i}</li>" for i in items)
         return (f"<div style='border:2px solid {border};background:{bg};color:{fg};"
@@ -793,18 +1001,26 @@ def build_summary(data, prev_full, positions=None, blocking=None, warnings=None,
 
     banner = ""
     if blocking:
-        banner = _bar("#c00", "#fff4f4", "#c00", "⚠️ 官网数据不完整,本报告部分口径缺失",
+        banner = _bar("#c00", "#fff4f4", "#c00",
+                      "⚠️ 以下项目缺失或无法计算,相关口径未纳入本报告",
                       blocking + warnings,
-                      "<div style='margin-top:6px'>数据补全后会自动补发一封「【更新】」版。</div>")
+                      "<div style='margin-top:6px'>若后续数据补齐,将自动补发一封「【更新】」版。</div>")
     else:
         if update_mode:
             banner = ("<div style='border:2px solid #0a0;background:#f3fff3;color:#070;"
                       "padding:8px 12px;margin-bottom:12px'><b>✅ 更新版</b> —— "
-                      "持仓数据经复核确认完整,本封替代此前那封带「数据不全」标记的日报。</div>")
+                      "此前一封因部分项目缺失而先行兜底发出;现相关数据已可完整计算,"
+                      "本封为其替代版。</div>")
         if warnings:
             banner += _bar("#c80", "#fffbf0", "#a60", "⚠️ 以下情况请留意", warnings)
 
     as_of_str = as_of.strftime("%Y-%m-%d") if as_of else "未知"
+    # 官网两个来源的期权名义敞口并排列出,只给数字不下结论。
+    cross_note = ""
+    if p.get("option_notional_pct_page") is not None and p.get("option_notional_pct") is not None:
+        cross_note = (f"期权名义敞口两来源并列供对照:持仓表逐腿加总 "
+                      f"{p['option_notional_pct']:.2f}% / 官网敞口表 "
+                      f"{p['option_notional_pct_page']:.2f}%。<br>")
     body = f"""\
 <html><body style="font-family:Arial,'Microsoft YaHei',sans-serif;font-size:14px">
 {banner}
@@ -829,17 +1045,17 @@ def build_summary(data, prev_full, positions=None, blocking=None, warnings=None,
 {top_rows}
 </table>
 
-<h3>较上一交易日变化(正股)</h3>
+<h3>较上一交易日差异</h3>
 {changes_html}
 
 <p style="color:#888;font-size:12px">
 注:Delta = Black-Scholes N(d1),{iv_desc};期货/期权敞口取自完整持仓表的合约行
 (名义 = 张数 × 指数 × {INDEX_MULTIPLIER:.0f}),{nav_note}。完整持仓见附件 CSV。<br>
-数据来源:{FUND_URL}<br>本邮件由脚本自动生成于 {datetime.now():%Y-%m-%d %H:%M:%S}。</p>
+{cross_note}数据来源:{FUND_URL}<br>本邮件由脚本自动生成于 {datetime.now():%Y-%m-%d %H:%M:%S}。</p>
 </body></html>"""
 
     as_of_compact = as_of.strftime("%Y%m%d") if as_of else date.today().strftime("%Y%m%d")
-    prefix = "【数据不全】" if blocking else ("【更新】" if update_mode else "")
+    prefix = "【待补全】" if blocking else ("【更新】" if update_mode else "")
     subject = f"{prefix}{as_of_compact} {FUND_NAME} 持仓"
     return subject, body
 
@@ -948,63 +1164,26 @@ def mark_sent(as_of, complete=True):
 
 
 # ----------------------------------------------------------------------------
-# 数据就绪判定 —— 官网存在「先放正股、稍后才补期货/期权行」的分阶段发布
+# 数据就绪判定 —— 只看「计算前提」与「整类工具相对前日消失」两类硬事实
 # ----------------------------------------------------------------------------
-def last_complete_snapshot(as_of, max_lookback=15):
-    """从新到旧找第一份**含衍生品**的历史快照,作为"该有多少条腿"的基准。
+def check_readiness(data, pos, diff):
+    """判断本次数据能否直接出报告。返回 (blocking, warnings, wait_worth)。
 
-    不能只看紧挨着的上一份 —— 那一份自己可能就是"官网只发了正股"时存下的残缺快照
-    (data/holdings_20260731.csv 就是),拿它当基准会让今天的缺失判不出来,
-    护栏自己把自己解除。
+    这里**不推断原始数据的对错**:与前一日快照的一切数量差异(腿数增减、
+    换仓滚动、张数变化……)由 diff_vs_previous 中性列出、直接进邮件,
+    既不拦截也不告警。只有两类事实会拦(blocking):
 
-    除腿数外,还返回基准里期权空头总张数(opt_contracts_abs)。同指数同乘数下
-    名义 ∝ |张数|,它就是「名义敞口」的代理指标:行数变少但总张数没缩水,
-    说明是换仓合并(周度到期滚入月度),不是漏腿 —— 详见 check_readiness。
-    """
-    cur = snapshot_path(as_of)
-    files = sorted(
-        (m.group(1), os.path.join(DATA_DIR, f))
-        for f in os.listdir(DATA_DIR)
-        for m in [re.match(r"holdings_(\d{8})\.csv$", f)] if m
-        and os.path.join(DATA_DIR, f) != cur
-    )
-    for _, path in reversed(files[-max_lookback:]):
-        try:
-            df = pd.read_csv(path)
-        except Exception:
-            continue
-        if "Name of Securities" not in df.columns:
-            continue
-        names = df["Name of Securities"].astype(str)
-        opt_mask = names.map(is_option)
-        n_o, n_f = int(opt_mask.sum()), int(names.map(is_future).sum())
-        if n_o or n_f:
-            opt_abs = 0.0
-            if n_o and "Number of Shares Held" in df.columns:
-                vals = pd.to_numeric(df.loc[opt_mask, "Number of Shares Held"],
-                                     errors="coerce").dropna()
-                opt_abs = float(vals.abs().sum())
-            return {"path": path, "options": n_o, "futures": n_f,
-                    "opt_contracts_abs": opt_abs}
-    return None
+      1. 计算前提缺失 —— 某条腿无法纳入敞口计算、缺指数点位导致期权敞口算不出。
+         这是"算不出来",不是"数据错了";
+      2. 整类工具相对前一日消失(如昨日有期权合约行、今日为 0)。官网存在
+         分阶段发布(先放正股、稍后补衍生品行),此时等一等大概率能等到全量。
 
+    blocking —— 拦截后走宽限等待/兜底发送,并允许数据补齐后自动补发【更新】版。
+    warnings —— 黄色告警条的事实性提示,不影响幂等。
+    wait_worth —— blocking 里是否至少有一项可能"等一等就好"(分阶段发布);
+                  否则(如官网彻底改版)白等没意义,直接发带提示的报告。
 
-def check_readiness(data, prev_full, pos):
-    """判断这份页面数据是否已经完整。返回 (blocking, warnings) 两个问题列表。
-
-    2026-07-31 那次就是栽在这:脚本在官网只发布了正股的时刻抓到了新的截止日期,
-    发出一封期货/期权全是 N/A 的日报,又因为幂等标记再也不会重发。
-
-    blocking —— 会让报告口径失真的问题:红色告警条 + 主题【数据不全】+ last_complete=False
-                 (于是数据补齐后能自动补发一封【更新】版)。
-    warnings —— 不影响数字、但值得让人知道的事,黄色告警条,不影响幂等。
-    wait_worth —— 这些 blocking 里是否**至少有一个**可能"等一等就好"(页面分阶段发布)。
-                 是则先不发信、等下次触发;否则(如官网彻底改版)白等没意义,直接发带警告的报告。
-
-    期权行数与基准的对比以「空头总张数」为准而非行数:行数变少可能只是换仓
-    (周度到期滚入月度,名义不变),只有总张数真的缩水才算漏腿。
-
-    关键:入参 pos 是 compute_positions 的结果。掉了哪条腿、与官网敞口表差多少,
+    关键:入参 pos 是 compute_positions 的结果。哪条腿因什么原因没算进去,
     只有它知道 —— 这些信号必须走到邮件里,光写 run.log 等于没写(CI 的日志随
     runner 一起销毁,而且 data/run.log 在 .gitignore 里)。
     """
@@ -1014,53 +1193,28 @@ def check_readiness(data, prev_full, pos):
         blocking.append(msg)
         waitable.append(wait)
 
-    o_legs, f_legs = data.get("option_legs") or [], data.get("futures_legs") or []
-    base = last_complete_snapshot(data["as_of"])
-    base_o = base["options"] if base else 0
-    base_f = base["futures"] if base else 0
+    o_legs = data.get("option_legs") or []
+    f_legs = data.get("futures_legs") or []
 
-    if not o_legs:
-        # 这是一只备兑开仓基金,常态就该有空头看涨期权;一条都没有基本等于页面没发全
-        block("完整持仓表里没有任何期权合约行"
-              + (f"(最近一份完整快照有 {base_o} 条)" if base_o else ""))
-    elif base_o and len(o_legs) < base_o:
-        # 行数少于基准未必是漏腿:换仓也会减行 —— 周度期权到期后并入月度腿,
-        # 2026-08-24 即是(4 条→3 条,但 -10,400 张周度恰好滚入 CHINA ENT 8700,
-        # 空头总张数分毫不变)。各腿都是同一指数的期权,名义 ∝ |张数|,
-        # 故以「空头总张数」代替行数做终审:不缩水 → 放行(黄色提示留痕);
-        # 缩水超容差 → 才是真漏腿/页面没发全,照旧拦截。
-        cur_abs = sum(abs(l["contracts"]) for l in o_legs if l.get("contracts"))
-        base_abs = (base or {}).get("opt_contracts_abs") or 0.0
-        if not base_abs or not cur_abs:
-            # 基准里没有可用张数 / 当前张数全缺失:退回行数口径,宁可误报不可漏报
-            block(f"期权合约行只有 {len(o_legs)} 条,少于最近一份完整快照的 {base_o} 条")
-        elif cur_abs < base_abs * (1 - NOTIONAL_MATCH_TOL):
-            block(f"期权合约行只有 {len(o_legs)} 条(基准 {base_o} 条),且空头总张数 "
-                  f"{cur_abs:,.0f} 比基准 {base_abs:,.0f} 少 "
-                  f"{(base_abs - cur_abs) / base_abs * 100:.1f}%,疑似漏腿")
-        else:
-            warnings.append(
-                f"期权合约行 {len(o_legs)} 条,少于基准快照的 {base_o} 条;"
-                f"空头总张数持平({cur_abs:,.0f} vs 基准 {base_abs:,.0f}),判定为换仓而非缺数据")
-    if not f_legs and base_f:
-        block(f"完整持仓表里没有期货合约行(最近一份完整快照有 {base_f} 条)")
+    # 整类工具相对前日消失:唯一基于数据量的拦截条件,文案只陈述差异本身。
+    if diff and diff["options"].get("rows_prev") and not o_legs:
+        block(f"较前一日:期权合约行 {diff['options']['rows_prev']}→0 条;"
+              f"若为官网分阶段发布,稍后重试即可")
+    if diff and diff["futures"].get("rows_prev") and not f_legs:
+        block(f"较前一日:期货合约行 {diff['futures']['rows_prev']}→0 条;"
+              f"若为官网分阶段发布,稍后重试即可")
     if o_legs and data.get("index_close") is None:
-        block("未取到 HSCEI 收盘点位,期权敞口无法计算")
+        block(f"未取到 HSCEI 收盘点位,{len(o_legs)} 条期权腿的敞口无法计算")
 
     # 被丢掉的腿:每一条都会让敞口偏小,必须显式列出来。
-    # 一律算 blocking(否则会被标成"数据完整",补齐后再也不会补发);
-    # wait_helps 只决定"要不要先等一等",不决定要不要标红。
+    # 一律算 blocking(否则会被当成"可完整计算",修好后再也不会补发);
+    # wait_helps 只决定"要不要先等一等",不决定要不要拦截。
     for d in (pos.get("dropped_legs") or []):
-        block(f"期权腿未计入敞口({d['reason']}):{d['name']}", wait=d.get("wait_helps", True))
+        block(f"期权腿未计入敞口计算({d['reason']}):{d['name']}", wait=d.get("wait_helps", True))
 
-    # 与官网敞口表对不上 = 极可能漏了腿或页面还没发全
-    gap = pos.get("cross_check_gap")
-    if gap is not None and gap > CROSS_CHECK_TOL_PP:
-        block(f"期权名义敞口与官网敞口表对不上:持仓表算得 {pos['option_notional_pct']:.2f}%,"
-              f"官网 {pos['option_notional_pct_page']:.2f}%,差 {gap:.2f} 个百分点")
-
+    # 事实性提示(黄色条,不拦):两个来源的数字对照见正文注脚。
     if o_legs and data["options"].empty:
-        warnings.append("官网「期权敞口表」缺失,敞口已改由完整持仓表计算,但无法交叉校验")
+        warnings.append("官网「期权敞口表」缺失,敞口已由完整持仓表计算")
     if data.get("nav_page") is None:
         warnings.append("页面未公布基金总净值,已改用「市值 ÷ 权重」反推,数值可能略有偏差")
     for nm in (data.get("unknown_instruments") or []):
@@ -1113,9 +1267,11 @@ def main():
             logger.warning("页面截止日期 %s 早于已发送的 %s,判为页面异常,跳过本次", as_of, last)
             return 0
 
-        prev_full = load_previous(as_of)
-        pos = compute_positions(data)          # 先算,因为掉腿/交叉校验结果要参与就绪判定
-        blocking, warnings, wait_worth = check_readiness(data, prev_full, pos)
+        prev_full, prev_meta = load_previous(as_of)
+        diff = diff_vs_previous(prev_full, prev_meta, data["full"],
+                                {"nav": data["nav"], "index_close": data["index_close"]})
+        pos = compute_positions(data)          # 先算,因为丢腿结果要参与就绪判定
+        blocking, warnings, wait_worth = check_readiness(data, pos, diff)
         ready = not blocking
         for w in warnings:
             logger.warning("数据告警(不阻断发信):%s", w)
@@ -1125,34 +1281,36 @@ def main():
         # 而那份 state 恰恰就是 2026-07-31 那封残缺日报留下的 —— 默认 True 会让它永远补不上。
         sent_incomplete = sent_before and not st.get("last_complete", False)
 
-        # 补发:上次发的是"数据不全"版,现在官网补齐了 → 再发一封【更新】版(每个截止日只补一次)
+        # 补发:上次发的是带【待补全】的兜底版,现在数据齐了 → 再发一封【更新】版(每个截止日只补一次)
         update_mode = sent_incomplete and ready
         if sent_before and not update_mode and not FORCE_SEND:
-            logger.info("截止日期 %s 已发送过(数据%s),跳过(可设 FORCE_SEND=1 强制发送)",
-                        as_of, "完整" if st.get("last_complete", False) else "不全,等官网补齐后自动补发")
+            logger.info("截止日期 %s 已发送过(可完整计算=%s),跳过(可设 FORCE_SEND=1 强制发送)",
+                        as_of, st.get("last_complete", False))
             return 0
 
         if not ready and not update_mode:
             if not wait_worth:
-                logger.warning("数据有问题且等待无益(%s);直接发一封带警告的日报,"
+                logger.warning("存在无法等待解决的拦截项(%s);直接发一封带提示的日报,"
                                "并留下 last_complete=False 以便修好后补发", ";".join(blocking))
             else:
                 waited = note_not_ready(as_of)
                 if waited < INCOMPLETE_GRACE_HOURS and not FORCE_SEND:
-                    logger.warning("官网数据未就绪(%s);已等待 %.1fh < 宽限 %.1fh,本次不发信、"
+                    logger.warning("存在拦截项(%s);已等待 %.1fh < 宽限 %.1fh,本次不发信、"
                                    "不写幂等标记,等下次触发", ";".join(blocking), waited,
                                    INCOMPLETE_GRACE_HOURS)
                     return 0
-                logger.warning("官网数据仍未就绪(%s);已超过 %.1fh 宽限,先发一封带警告的日报兜底,"
+                logger.warning("拦截项仍未消除(%s);已超过 %.1fh 宽限,先发一封【待补全】日报兜底,"
                                "补齐后会自动补发更新版", ";".join(blocking), INCOMPLETE_GRACE_HOURS)
 
-        path = save_snapshot(data["full"], as_of)   # 附件存完整持仓(含衍生品),与官网导出一致
-        subject, body = build_summary(data, prev_full, positions=pos, blocking=blocking,
+        meta = {"as_of": as_of.isoformat(), "nav": data["nav"],
+                "nav_page": data["nav_page"], "index_close": data["index_close"]}
+        path = save_snapshot(data["full"], as_of, meta=meta)   # 附件存完整持仓(含衍生品),与官网导出一致
+        subject, body = build_summary(data, diff, positions=pos, blocking=blocking,
                                       warnings=warnings, update_mode=update_mode)
         send_email(subject, body, attachments=[path])
         mark_sent(as_of, complete=ready)
         logger.info("===== 任务成功(%s)=====",
-                    "更新版补发" if update_mode else ("数据完整" if ready else "数据不全,已带警告"))
+                    "更新版补发" if update_mode else ("可完整计算" if ready else "有拦截项,已带提示发送"))
         return 0
     except Exception as e:
         logger.exception("任务失败: %s", e)
