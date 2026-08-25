@@ -75,8 +75,9 @@ MAIL_TO = [a.strip() for a in env("MAIL_TO", "").split(",") if a.strip()]
 DATA_DIR = env("DATA_DIR", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data"))
 FORCE_SEND = env("FORCE_SEND", "").lower() in ("1", "true", "yes")  # 调试用:忽略幂等强制发送
 
-HTTP_TIMEOUT = 30          # 秒,连接+读取
+HTTP_TIMEOUT = 60          # 秒,页面抓取读取超时(官网响应慢,放宽以减少误报)
 HTTP_RETRIES = 3           # 下载失败重试次数
+SMTP_TIMEOUT = 30          # 秒,SMTP 连接/读写超时
 SMTP_RETRIES = 3           # 发信失败重试次数
 
 # 仓位计算参数
@@ -812,11 +813,11 @@ def build_summary(data, prev_full, positions=None, blocking=None, warnings=None,
 </table>
 
 <h3>b. 风险暴露</h3>
+{net_html}
 <table border="1" cellspacing="0" cellpadding="4">
 <tr><th>仓位</th><th>名义占净值</th><th>Delta调整后</th><th>算法</th></tr>
 {pos_rows}
 </table>
-{net_html}
 
 <h3>c. 前五大重仓占比 {top5_pct:.2f}%</h3>
 <table border="1" cellspacing="0" cellpadding="4">
@@ -869,11 +870,11 @@ def send_email(subject, html_body, attachments=None):
             if SMTP_PORT == 465:
                 with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT,
                                       context=ssl.create_default_context(),
-                                      timeout=HTTP_TIMEOUT) as s:
+                                      timeout=SMTP_TIMEOUT) as s:
                     s.login(SMTP_USER, SMTP_PASS)
                     s.send_message(msg)
             else:
-                with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=HTTP_TIMEOUT) as s:
+                with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as s:
                     s.starttls(context=ssl.create_default_context())
                     s.login(SMTP_USER, SMTP_PASS)
                     s.send_message(msg)
