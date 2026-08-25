@@ -90,6 +90,10 @@ INCOMPLETE_GRACE_HOURS = float(env("INCOMPLETE_GRACE_HOURS", "3"))
 # 持仓表算出的期权名义敞口 与 官网期权敞口表 差异超过这个百分点就判为"漏腿"(交叉校验)。
 # 页面占比按 0.01pp 取整,几条腿的舍入噪声上限约 0.05pp,所以 0.3pp 已经远高于噪声。
 CROSS_CHECK_TOL_PP = 0.3
+# 期权行数少于基准快照时的「换仓」判定容差。同指数同乘数下名义 ∝ |张数|,
+# 总张数缩水 ≤1% 视为与基准持平 → 判为换仓(如周度期权到期滚入月度腿)而非缺数据。
+# 张数是精确整数,仓位不动时分毫不变;真正的整腿丢失通常远超 1%,不会漏报。
+NOTIONAL_MATCH_TOL = 0.01
 
 # 持仓表必须包含的关键列(对不上就报错,绝不默默算错)
 REQUIRED_COLS = ["Name of Securities", "Exchange Ticker", "Net Assets (%)"]
@@ -796,7 +800,7 @@ def build_summary(data, prev_full, positions=None, blocking=None, warnings=None,
         if update_mode:
             banner = ("<div style='border:2px solid #0a0;background:#f3fff3;color:#070;"
                       "padding:8px 12px;margin-bottom:12px'><b>✅ 更新版</b> —— "
-                      "官网已补齐期货/期权数据,本封替代此前那封不完整的日报。</div>")
+                      "持仓数据经复核确认完整,本封替代此前那封带「数据不全」标记的日报。</div>")
         if warnings:
             banner += _bar("#c80", "#fffbf0", "#a60", "⚠️ 以下情况请留意", warnings)
 
@@ -952,6 +956,10 @@ def last_complete_snapshot(as_of, max_lookback=15):
     不能只看紧挨着的上一份 —— 那一份自己可能就是"官网只发了正股"时存下的残缺快照
     (data/holdings_20260731.csv 就是),拿它当基准会让今天的缺失判不出来,
     护栏自己把自己解除。
+
+    除腿数外,还返回基准里期权空头总张数(opt_contracts_abs)。同指数同乘数下
+    名义 ∝ |张数|,它就是「名义敞口」的代理指标:行数变少但总张数没缩水,
+    说明是换仓合并(周度到期滚入月度),不是漏腿 —— 详见 check_readiness。
     """
     cur = snapshot_path(as_of)
     files = sorted(
@@ -968,9 +976,16 @@ def last_complete_snapshot(as_of, max_lookback=15):
         if "Name of Securities" not in df.columns:
             continue
         names = df["Name of Securities"].astype(str)
-        n_o, n_f = int(names.map(is_option).sum()), int(names.map(is_future).sum())
+        opt_mask = names.map(is_option)
+        n_o, n_f = int(opt_mask.sum()), int(names.map(is_future).sum())
         if n_o or n_f:
-            return {"path": path, "options": n_o, "futures": n_f}
+            opt_abs = 0.0
+            if n_o and "Number of Shares Held" in df.columns:
+                vals = pd.to_numeric(df.loc[opt_mask, "Number of Shares Held"],
+                                     errors="coerce").dropna()
+                opt_abs = float(vals.abs().sum())
+            return {"path": path, "options": n_o, "futures": n_f,
+                    "opt_contracts_abs": opt_abs}
     return None
 
 
@@ -985,6 +1000,9 @@ def check_readiness(data, prev_full, pos):
     warnings —— 不影响数字、但值得让人知道的事,黄色告警条,不影响幂等。
     wait_worth —— 这些 blocking 里是否**至少有一个**可能"等一等就好"(页面分阶段发布)。
                  是则先不发信、等下次触发;否则(如官网彻底改版)白等没意义,直接发带警告的报告。
+
+    期权行数与基准的对比以「空头总张数」为准而非行数:行数变少可能只是换仓
+    (周度到期滚入月度,名义不变),只有总张数真的缩水才算漏腿。
 
     关键:入参 pos 是 compute_positions 的结果。掉了哪条腿、与官网敞口表差多少,
     只有它知道 —— 这些信号必须走到邮件里,光写 run.log 等于没写(CI 的日志随
@@ -1006,7 +1024,24 @@ def check_readiness(data, prev_full, pos):
         block("完整持仓表里没有任何期权合约行"
               + (f"(最近一份完整快照有 {base_o} 条)" if base_o else ""))
     elif base_o and len(o_legs) < base_o:
-        block(f"期权合约行只有 {len(o_legs)} 条,少于最近一份完整快照的 {base_o} 条")
+        # 行数少于基准未必是漏腿:换仓也会减行 —— 周度期权到期后并入月度腿,
+        # 2026-08-24 即是(4 条→3 条,但 -10,400 张周度恰好滚入 CHINA ENT 8700,
+        # 空头总张数分毫不变)。各腿都是同一指数的期权,名义 ∝ |张数|,
+        # 故以「空头总张数」代替行数做终审:不缩水 → 放行(黄色提示留痕);
+        # 缩水超容差 → 才是真漏腿/页面没发全,照旧拦截。
+        cur_abs = sum(abs(l["contracts"]) for l in o_legs if l.get("contracts"))
+        base_abs = (base or {}).get("opt_contracts_abs") or 0.0
+        if not base_abs or not cur_abs:
+            # 基准里没有可用张数 / 当前张数全缺失:退回行数口径,宁可误报不可漏报
+            block(f"期权合约行只有 {len(o_legs)} 条,少于最近一份完整快照的 {base_o} 条")
+        elif cur_abs < base_abs * (1 - NOTIONAL_MATCH_TOL):
+            block(f"期权合约行只有 {len(o_legs)} 条(基准 {base_o} 条),且空头总张数 "
+                  f"{cur_abs:,.0f} 比基准 {base_abs:,.0f} 少 "
+                  f"{(base_abs - cur_abs) / base_abs * 100:.1f}%,疑似漏腿")
+        else:
+            warnings.append(
+                f"期权合约行 {len(o_legs)} 条,少于基准快照的 {base_o} 条;"
+                f"空头总张数持平({cur_abs:,.0f} vs 基准 {base_abs:,.0f}),判定为换仓而非缺数据")
     if not f_legs and base_f:
         block(f"完整持仓表里没有期货合约行(最近一份完整快照有 {base_f} 条)")
     if o_legs and data.get("index_close") is None:
