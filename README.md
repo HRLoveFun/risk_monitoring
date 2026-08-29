@@ -97,11 +97,12 @@
 ## 本地运行
 ```bash
 pip install -r requirements.txt
+pip install -r requirements-dev.txt
 cp .env.example .env          # 填好邮箱授权码和收件人
 set -a; source .env; set +a   # 加载环境变量
-python daily_holdings.py
+python -m daily_holdings
 ```
-快照、日志、状态都在 `data/` 下。调试想强制重发:`FORCE_SEND=1 python daily_holdings.py`
+快照、日志、状态都在 `data/` 下。调试想强制重发:`FORCE_SEND=1 python -m daily_holdings`
 
 ## Foxmail / QQ 邮箱配置
 `SMTP_PASS` 填的是**授权码**,不是登录密码:
@@ -133,5 +134,5 @@ QQ邮箱 → 设置 → 账号 → 开启 IMAP/SMTP → 生成授权码。
 >
 > 想改用自己的服务器(如 Oracle Cloud 永久免费机)也行,等价 crontab:
 > ```cron
-> */10 11-23 * * 1-5  cd /path/app && set -a && . ./.env && set +a && /path/venv/bin/python daily_holdings.py
+> */10 11-23 * * 1-5  cd /path/app && set -a && . ./.env && set +a && /path/venv/bin/python -m daily_holdings
 > ```

@@ -3,3 +3,5 @@ data/run.log
 __pycache__/
 *.pyc
 .DS_Store
+.pytest_cache/
+daily_holdings/data/

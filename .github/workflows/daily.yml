@@ -20,7 +20,7 @@ jobs:
 
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.12"
+          python-version: "3.13"
 
       - run: pip install -r requirements.txt
 
@@ -35,7 +35,7 @@ jobs:
           # 非敏感参数,直接写在这里(改基金只需改这两行)
           FUND_NAME: "3416.HK"
           FUND_URL: "https://www.globalxetfs.com.hk/funds/hscei-covered-call-etf/"
-        run: python daily_holdings.py
+        run: python -m daily_holdings
 
       - name: Persist snapshots
         if: always()
