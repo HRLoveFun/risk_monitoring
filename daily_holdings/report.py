@@ -66,9 +66,11 @@ def build_summary(
         f"调整 = 名义 × Delta({iv_desc})</td></tr>"
     )
     net_directional = None
-    vals = [p.get("equity_pct"), p.get("futures_pct"), p.get("option_pressure_pct")]
+    vals = [p.get("equity_pct"), p.get("futures_pct")]
     if None not in vals:
         net_directional = sum(vals)
+        if p.get("option_pressure_pct") is not None:
+            net_directional += p.get("option_pressure_pct")
     net_html = (
         ""
         if net_directional is None
@@ -95,7 +97,11 @@ def build_summary(
             return "—"
         return f"{v:,.0f}" if float(v).is_integer() else f"{v:,.2f}"
 
-    changes_html = "<p>首次运行,无历史快照可对比。</p>"
+    changes_html = (
+        "<table border='1' cellspacing='0' cellpadding='4'>"
+        "<tr><td colspan=4>首次运行,无历史快照可对比。</td></tr>"
+        "</table>"
+    )
     if diff and diff.get("has_prev"):
         eq_d, fu_d, op_d = diff["equities"], diff["futures"], diff["options"]
 
@@ -178,9 +184,11 @@ def build_summary(
             "#fff4f4",
             "#c00",
             "⚠️ 以下项目缺失或无法计算,相关口径未纳入本报告",
-            blocking + warnings,
+            blocking,
             "<div style='margin-top:6px'>若后续数据补齐,将自动补发一封「【更新】」版。</div>",
         )
+        if warnings:
+            banner += _bar("#c80", "#fffbf0", "#a60", "⚠️ 以下情况请留意", warnings)
     else:
         if update_mode:
             banner = (
@@ -200,8 +208,12 @@ def build_summary(
             f"{p['option_notional_pct']:.2f}% / 官网敞口表 "
             f"{p['option_notional_pct_page']:.2f}%。<br>"
         )
+    data_source_line = f"数据来源:{FUND_URL}<br>"
+    if cross_note:
+        cross_note += data_source_line
+        data_source_line = ""
     body = f"""\
-<html><body style="font-family:Arial,'Microsoft YaHei',sans-serif;font-size:14px">
+<html><head><meta charset="utf-8"></head><body style="font-family:Arial,'Microsoft YaHei',sans-serif;font-size:14px">
 {banner}
 <p><b>持仓截止日期:</b>{as_of_str}</p>
 
@@ -230,7 +242,7 @@ def build_summary(
 <p style="color:#888;font-size:12px">
 注:Delta = Black-Scholes N(d1),{iv_desc};期货/期权敞口取自完整持仓表的合约行
 (名义 = 张数 × 指数 × {INDEX_MULTIPLIER:.0f}),{nav_note}。完整持仓见附件 CSV。<br>
-{cross_note}数据来源:{FUND_URL}<br>本邮件由脚本自动生成于 {datetime.now():%Y-%m-%d %H:%M:%S}。</p>
+{cross_note}{data_source_line}本邮件由脚本自动生成于 {datetime.now():%Y-%m-%d %H:%M:%S}。</p>
 </body></html>"""
 
     as_of_compact = as_of.strftime("%Y%m%d") if as_of else date.today().strftime("%Y%m%d")
