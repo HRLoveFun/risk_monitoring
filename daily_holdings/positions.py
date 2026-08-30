@@ -153,6 +153,7 @@ def compute_positions(data: dict[str, Any]) -> dict[str, Any]:
             {
                 "index": index_price,
                 "strike": r["strike"],
+                "expiry": r["expiry"],
                 "days": r["days"],
                 "dist_pct": (r["strike"] - index_price) / index_price * 100,
                 "iv": r["iv"],

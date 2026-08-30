@@ -77,6 +77,7 @@ def diff_vs_previous(
 ) -> dict[str, Any]:
     diff: dict[str, Any] = {
         "has_prev": prev_full is not None and not prev_full.empty,
+        "base_date": None,
         "equities": {"added": [], "removed": [], "weight_changes": []},
         "futures": {"added": [], "removed": [], "changed": [], "rows_prev": 0, "rows_cur": 0},
         "options": {
@@ -92,6 +93,9 @@ def diff_vs_previous(
     }
     if cur_full is None or cur_full.empty or "Name of Securities" not in cur_full.columns:
         return diff
+    if diff["has_prev"] and isinstance(prev_meta, dict) and prev_meta.get("as_of"):
+        diff["base_date"] = str(prev_meta["as_of"])
+
     prev_eq = prev_deriv = None
     if diff["has_prev"] and "Name of Securities" in prev_full.columns:
         prev_eq, prev_deriv, _ = split_equities(prev_full)

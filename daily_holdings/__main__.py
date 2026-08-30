@@ -11,7 +11,7 @@ from daily_holdings.config import (
 from daily_holdings.notifier import send_email, send_failure_alert
 from daily_holdings.parser import parse_holdings
 from daily_holdings.positions import compute_positions
-from daily_holdings.report import build_summary
+from daily_holdings.report import build_report
 from daily_holdings.scraper import fetch_page
 from daily_holdings.snapshot import diff_vs_previous, load_previous, save_snapshot
 from daily_holdings.state import (
@@ -98,10 +98,10 @@ def main() -> int:
             "index_close": data["index_close"],
         }
         path = save_snapshot(data["full"], as_of, meta=meta)
-        subject, body = build_summary(
+        subject, body, text_body = build_report(
             data, diff, positions=pos, blocking=blocking, warnings=warnings, update_mode=update_mode
         )
-        send_email(subject, body, attachments=[path])
+        send_email(subject, body, text_body=text_body, attachments=[path])
         mark_sent(as_of, complete=ready)
         logger.info(
             "===== 任务成功(%s)=====",
