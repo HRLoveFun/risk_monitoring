@@ -1,6 +1,6 @@
 .env
-data/run.log
-__pycache__/
+data/
+daily_holdings/data/
 *.pyc
 .DS_Store
 .pytest_cache/
