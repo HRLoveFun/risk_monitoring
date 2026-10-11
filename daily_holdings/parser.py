@@ -93,9 +93,11 @@ def parse_option_name(name: str) -> tuple[float | None, date | None]:
     rest = re.sub(r"\d{1,2}/\d{1,2}/\d{2,4}", " ", s)
     m = re.search(r"\b[CP]\s?(\d[\d ]*)", rest)
     if not m:
+        # 数字 token 以空白为界(空格是分隔符,不跨空格拼接),token 内允许逗号;
+        # 否则 "WEEK 2 8075" 会把周数 2 与行权价拼成 28075。
         nums = [
             d
-            for d in (re.sub(r"\D", "", t) for t in re.findall(r"\d[\d, ]*\d|\d", rest))
+            for d in (re.sub(r"\D", "", t) for t in re.findall(r"\d[\d,]*\d|\d", rest))
             if d and float(d) >= 1000
         ]
         return (float(nums[-1]) if nums else None), expiry

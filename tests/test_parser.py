@@ -99,6 +99,15 @@ class TestParseOptionName:
         assert expiry.month == 8
         assert expiry.day == 28
 
+    def test_weekly_with_week_number(self):
+        # 回归:兜底分支曾把周数 2 与行权价拼成 28075
+        strike, expiry = parse_option_name("CALL HSCEI WEEKLY OPTIONS WEEK 2 10/09/26 8075")
+        assert strike == 8075.0
+        assert expiry is not None
+        assert expiry.year == 2026
+        assert expiry.month == 10
+        assert expiry.day == 9
+
     def test_broken_c(self):
         strike, expiry = parse_option_name("CALL HSCEI 07/30/26 C770 0 OTC")
         assert strike == 7700.0
